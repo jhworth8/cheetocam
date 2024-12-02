@@ -9,7 +9,7 @@ from pytz import timezone
 # Email configuration
 SENDER_EMAIL = 'acatwasdetected@gmail.com'
 SENDER_PASSWORD = 'bnxh uwio rvhi mevk'
-RECIPIENT_EMAILS = ['jhworth8@gmail.com', 'cardosie4@gmail.com']
+RECIPIENT_EMAILS = ['jhworth8@gmail.com', 'cardosie4@gmail.com']  # List of recipient emails
 
 # Load the Haar Cascade for cat face detection
 cascade_path = 'haarcascade_frontalcatface.xml'
@@ -24,7 +24,7 @@ def send_email_with_attachment(image_path):
 
     msg = EmailMessage()
     msg['From'] = SENDER_EMAIL
-    msg['To'] = RECIPIENT_EMAIL
+    msg['To'] = ', '.join(RECIPIENT_EMAILS)  # Join recipient emails with commas
     msg['Subject'] = subject
     msg.set_content('A cat has been detected outside your door. See the attached image.')
 
@@ -35,7 +35,7 @@ def send_email_with_attachment(image_path):
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.send_message(msg)
-        print(f"Email sent! Subject: {subject}")
+        print(f"Email sent! Subject: {subject} to {', '.join(RECIPIENT_EMAILS)}")
 
 # Initialize camera
 cap = cv2.VideoCapture(0)
