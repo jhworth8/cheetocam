@@ -4,6 +4,7 @@ import smtplib
 from email.message import EmailMessage
 import time
 from datetime import datetime
+from pytz import timezone
 
 # Email configuration
 SENDER_EMAIL = 'acatwasdetected@gmail.com'
@@ -16,8 +17,9 @@ cat_cascade = cv2.CascadeClassifier(cascade_path)
 
 # Function to send email with attachment
 def send_email_with_attachment(image_path):
-    # Get the current time
-    current_time = datetime.now().strftime("%H:%M")
+    # Get the current Eastern Time
+    eastern = timezone('US/Eastern')
+    current_time = datetime.now(eastern).strftime("%I:%M %p ET")
     subject = f"Cat Detected at {current_time}!"
 
     msg = EmailMessage()
