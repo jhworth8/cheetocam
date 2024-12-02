@@ -5,7 +5,7 @@ from email.message import EmailMessage
 
 # Email configuration
 SENDER_EMAIL = 'acatwasdetected@gmail.com'
-SENDER_PASSWORD = 'CheetoTheCat123!'
+SENDER_PASSWORD = 'bnxh uwio rvhi mevk'
 RECIPIENT_EMAIL = 'jhworth8@gmail.com'
 
 # Load the Haar Cascade for cat face detection
