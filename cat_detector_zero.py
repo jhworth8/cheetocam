@@ -9,7 +9,7 @@ from pytz import timezone
 # Email configuration
 SENDER_EMAIL = 'acatwasdetected@gmail.com'
 SENDER_PASSWORD = 'bnxh uwio rvhi mevk'
-RECIPIENT_EMAIL = 'jhworth8@gmail.com'
+RECIPIENT_EMAILS = ['jhworth8@gmail.com', 'cardosie4@gmail.com']
 
 # Load the Haar Cascade for cat face detection
 cascade_path = 'haarcascade_frontalcatface.xml'
