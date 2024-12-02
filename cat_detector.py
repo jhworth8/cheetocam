@@ -14,7 +14,7 @@ RECIPIENT_EMAIL = 'jhworth8@gmail.com'
 MODEL_PATH = 'cat_detector.h5'
 model = tf.keras.models.load_model(MODEL_PATH)
 
-# Function to preprocess frame for model
+# Function to preprocess frame for model 
 def preprocess_frame(frame):
     resized_frame = cv2.resize(frame, (224, 224))  # Adjust based on model input size
     normalized_frame = resized_frame / 255.0
