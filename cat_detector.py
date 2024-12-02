@@ -1,6 +1,4 @@
 import cv2
-import numpy as np
-import tensorflow as tf
 import os
 import smtplib
 from email.message import EmailMessage
@@ -10,22 +8,9 @@ SENDER_EMAIL = 'acatwasdetected@gmail.com'
 SENDER_PASSWORD = 'CheetoTheCat123!'
 RECIPIENT_EMAIL = 'jhworth8@gmail.com'
 
-# Load the pre-trained model
-MODEL_PATH = 'cat_detector.h5'
-model = tf.keras.models.load_model(MODEL_PATH)
-
-# Function to preprocess frame for model 
-def preprocess_frame(frame):
-    resized_frame = cv2.resize(frame, (224, 224))  # Adjust based on model input size
-    normalized_frame = resized_frame / 255.0
-    input_data = np.expand_dims(normalized_frame, axis=0)
-    return input_data
-
-# Function to capture and save image
-def capture_image(frame):
-    image_path = 'cat_detected.jpg'
-    cv2.imwrite(image_path, frame)
-    return image_path
+# Load the Haar Cascade for cat face detection
+cascade_path = 'haarcascade_frontalcatface.xml'
+cat_cascade = cv2.CascadeClassifier(cascade_path)
 
 # Function to send email with attachment
 def send_email_with_attachment(image_path):
@@ -53,11 +38,13 @@ try:
         if not ret:
             break
 
-        input_data = preprocess_frame(frame)
-        prediction = model.predict(input_data)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        cats = cat_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(75, 75))
 
-        if prediction[0][0] > 0.5:  # Adjust threshold if necessary
-            image_path = capture_image(frame)
+        for (x, y, w, h) in cats:
+            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            image_path = 'cat_detected.jpg'
+            cv2.imwrite(image_path, frame)
             send_email_with_attachment(image_path)
             print("Cat detected!")
 
