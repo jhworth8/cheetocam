@@ -2,6 +2,7 @@ import cv2
 import os
 import smtplib
 from email.message import EmailMessage
+import time
 
 # Email configuration
 SENDER_EMAIL = 'acatwasdetected@gmail.com'
@@ -32,26 +33,44 @@ def send_email_with_attachment(image_path):
 # Initialize camera
 cap = cv2.VideoCapture(0)
 
+# Variables for cooldown and frame throttling
+cooldown_time = 30  # Cooldown time in seconds
+last_detection_time = 0
+frame_delay = 0.5  # Delay between frames for ~2 FPS
+
 try:
     while True:
+        start_time = time.time()
         ret, frame = cap.read()
         if not ret:
             break
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        cats = cat_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(75, 75))
+        # Check if enough time has passed since the last detection
+        if time.time() - last_detection_time > cooldown_time:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cats = cat_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(75, 75))
 
-        for (x, y, w, h) in cats:
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
-            image_path = 'cat_detected.jpg'
-            cv2.imwrite(image_path, frame)
-            send_email_with_attachment(image_path)
-            print("Cat detected!")
+            if len(cats) > 0:  # If a cat is detected
+                for (x, y, w, h) in cats:
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                image_path = 'cat_detected.jpg'
+                cv2.imwrite(image_path, frame)
+                send_email_with_attachment(image_path)
+                print("Cat detected!")
+                last_detection_time = time.time()  # Reset the cooldown timer
 
-        # cv2.imwrite('current_frame.jpg', frame)
+        # Show the current frame
         cv2.imshow('Cat Detection', frame)
+
+        # Maintain 2 FPS by adding a delay
+        elapsed_time = time.time() - start_time
+        if elapsed_time < frame_delay:
+            time.sleep(frame_delay - elapsed_time)
+
+        # Quit on 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+
 except Exception as e:
     print(f"An error occurred: {e}")
 finally:
