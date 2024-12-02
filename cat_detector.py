@@ -48,9 +48,7 @@ try:
             send_email_with_attachment(image_path)
             print("Cat detected!")
 
-        cv2.imshow('Cat Detection', frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        cv2.imwrite('current_frame.jpg', frame)
 except Exception as e:
     print(f"An error occurred: {e}")
 finally:
