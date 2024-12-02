@@ -11,7 +11,7 @@ SENDER_PASSWORD = 'CheetoTheCat123!'
 RECIPIENT_EMAIL = 'jhworth8@gmail.com'
 
 # Load the pre-trained model
-MODEL_PATH = 'cat_detector.h5'
+MODEL_PATH = 'cat_detector_updated.h5'
 model = tf.keras.models.load_model(MODEL_PATH)
 
 # Function to preprocess frame for model 
