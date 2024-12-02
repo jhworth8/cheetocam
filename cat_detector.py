@@ -3,6 +3,7 @@ import os
 import smtplib
 from email.message import EmailMessage
 import time
+from datetime import datetime
 
 # Email configuration
 SENDER_EMAIL = 'acatwasdetected@gmail.com'
@@ -15,10 +16,14 @@ cat_cascade = cv2.CascadeClassifier(cascade_path)
 
 # Function to send email with attachment
 def send_email_with_attachment(image_path):
+    # Get the current time
+    current_time = datetime.now().strftime("%H:%M")
+    subject = f"Cat Detected at {current_time}!"
+
     msg = EmailMessage()
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
-    msg['Subject'] = 'Cat Detected!'
+    msg['Subject'] = subject
     msg.set_content('A cat has been detected outside your door. See the attached image.')
 
     with open(image_path, 'rb') as img:
@@ -28,7 +33,7 @@ def send_email_with_attachment(image_path):
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.send_message(msg)
-        print('Email sent!')
+        print(f"Email sent! Subject: {subject}")
 
 # Initialize camera
 cap = cv2.VideoCapture(0)
