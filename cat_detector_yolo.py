@@ -217,7 +217,8 @@ def check_email(cap):
 # Initialize Camera
 # ==============================
 
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Use DirectShow backend; adjust as needed
+# cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Use DirectShow backend; adjust as needed
+cap = cv2.VideoCapture("/dev/video0")
 
 if not cap.isOpened():
     print("Cannot open camera")
