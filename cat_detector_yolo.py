@@ -10,6 +10,20 @@ from pytz import timezone
 import numpy as np
 import requests  # Ensure you have the requests library installed
 import base64
+import logging
+
+# ==============================
+# Logging Configuration
+# ==============================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("cat_detector.log"),
+        logging.StreamHandler()
+    ]
+)
 
 # ==============================
 # Configuration Section
@@ -60,6 +74,7 @@ with open(names_path, 'r') as f:
 
 # Ensure 'cat' is in the classes
 if 'cat' not in classes:
+    logging.error("'cat' class not found in COCO names.")
     raise ValueError("'cat' class not found in COCO names.")
 
 # Get the index of 'cat' class
@@ -101,17 +116,17 @@ def upload_image_to_imgbb(image_path, api_key):
         if response.status_code == 200:
             json_response = response.json()
             image_url = json_response['data']['url']
-            print(f"Image uploaded to imgbb: {image_url}")
+            logging.info(f"Image uploaded to imgbb: {image_url}")
             return image_url
         else:
-            print(f"Failed to upload image to imgbb. Status Code: {response.status_code}")
-            print(f"Response: {response.text}")
+            logging.error(f"Failed to upload image to imgbb. Status Code: {response.status_code}")
+            logging.error(f"Response: {response.text}")
             return None
     except requests.exceptions.Timeout:
-        print("Image upload to imgbb timed out.")
+        logging.error("Image upload to imgbb timed out.")
         return None
     except Exception as e:
-        print(f"Exception during image upload to imgbb: {e}")
+        logging.error(f"Exception during image upload to imgbb: {e}")
         return None
 
 def send_email_with_attachments(image_paths, subject, message, phone_recipients, email_recipients):
@@ -136,7 +151,7 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
 
         for image_path in image_paths:
             if not os.path.exists(image_path):
-                print(f"Image path {image_path} does not exist. Skipping attachment.")
+                logging.warning(f"Image path {image_path} does not exist. Skipping attachment.")
                 continue
 
             with open(image_path, 'rb') as img:
@@ -152,9 +167,9 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
             with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
                 server.login(SENDER_EMAIL, SENDER_PASSWORD)
                 server.send_message(msg)
-                print(f"Email (MMS) sent to {recipient}! Subject: {subject}")
+                logging.info(f"Email (MMS) sent to {recipient}! Subject: {subject}")
         except Exception as e:
-            print(f"Failed to send email (MMS) to {recipient}: {e}")
+            logging.error(f"Failed to send email (MMS) to {recipient}: {e}")
 
 def check_email(cap):
     """
@@ -175,12 +190,12 @@ def check_email(cap):
             for email_id in email_ids:
                 result, msg_data = mail.fetch(email_id, '(RFC822)')
                 if result != 'OK':
-                    print(f"Failed to fetch email ID {email_id}")
+                    logging.error(f"Failed to fetch email ID {email_id}")
                     continue
 
                 msg = email.message_from_bytes(msg_data[0][1])
                 sender = email.utils.parseaddr(msg['From'])[1]
-                print(f"New email detected from: {sender}")
+                logging.info(f"New email detected from: {sender}")
 
                 # Take a picture
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -188,14 +203,13 @@ def check_email(cap):
                 ret, frame = cap.read()
                 if ret:
                     cv2.imwrite(image_path, frame)
-                    print(f"Captured image saved: {image_path}")
+                    logging.info(f"Captured image saved: {image_path}")
                 else:
-                    print("Failed to capture image.")
+                    logging.error("Failed to capture image.")
                     continue
 
                 # Send the captured image back to the sender
                 eastern = timezone('US/Eastern')
-                # timestamp_str = datetime.now(eastern).strftime("%I:%M %p ET")  # This line is no longer needed for subject
                 subject = "Here is what's going on!"  # Updated subject line
                 message = 'Currently outside the door...'
                 send_email_with_attachments(
@@ -211,7 +225,7 @@ def check_email(cap):
 
         mail.logout()
     except Exception as e:
-        print(f"Error in checking email: {e}")
+        logging.error(f"Error in checking email: {e}")
 
 # ==============================
 # Initialize Camera
@@ -221,7 +235,7 @@ def check_email(cap):
 cap = cv2.VideoCapture("/dev/video0")
 
 if not cap.isOpened():
-    print("Cannot open camera")
+    logging.error("Cannot open camera")
     exit()
 
 # ==============================
@@ -241,7 +255,7 @@ try:
         loop_start_time = time.time()
         ret, frame = cap.read()
         if not ret:
-            print("Failed to grab frame.")
+            logging.error("Failed to grab frame.")
             break
 
         # Check if it's time to check emails
@@ -298,7 +312,7 @@ try:
             if cat_detected:
                 if cat_detected_start_time is None:
                     cat_detected_start_time = current_time
-                    print("Cat detected. Starting 5-second timer.")
+                    logging.info("Cat detected. Starting 5-second timer.")
                 else:
                     elapsed = current_time - cat_detected_start_time
                     if elapsed >= DETECTION_DURATION:
@@ -306,7 +320,7 @@ try:
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         full_image_path = f'cat_detected_{timestamp}.jpg'
                         cv2.imwrite(full_image_path, frame)
-                        print("5 seconds of continuous detection. Taking full-frame picture.")
+                        logging.info("5 seconds of continuous detection. Taking full-frame picture.")
 
                         # Initialize list of image paths to send
                         image_paths = [full_image_path]
@@ -318,22 +332,11 @@ try:
                             cropped_image_path = f'cat_cropped_{timestamp}_{idx}.jpg'
                             cv2.imwrite(cropped_image_path, cropped_image)
                             image_paths.append(cropped_image_path)
-                            print(f"Cropped image saved: {cropped_image_path}")
-
-                        # Optional: Upload images to imgbb and collect URLs
-                        # media_urls = []
-                        # for img_path in image_paths:
-                        #     url = upload_image_to_imgbb(img_path, IMGBB_API_KEY)
-                        #     if url:
-                        #         media_urls.append(url)
+                            logging.info(f"Cropped image saved: {cropped_image_path}")
 
                         # Send email (MMS) to phone recipients and email notifications
                         eastern = timezone('US/Eastern')
-                        # timestamp_str = datetime.now(eastern).strftime("%I:%M %p ET")  # No longer needed for subject
                         subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
-                        # To change the subject when an email is detected, ensure the subject here is for detection alerts
-                        # Since the user requested changing the subject for email-triggered responses,
-                        # no changes are needed here unless desired
                         message = 'A cat has been detected outside your door!'
                         send_email_with_attachments(
                             image_paths=image_paths,
@@ -348,40 +351,22 @@ try:
                         cat_detected_start_time = None  # Reset for next detection
             else:
                 if cat_detected_start_time is not None:
-                    print("Cat no longer detected. Resetting timer.")
+                    logging.info("Cat no longer detected. Resetting timer.")
                 cat_detected_start_time = None  # Reset timer if cat not detected
 
-        # Draw bounding boxes if any
-        if cat_detected and indexes is not None:
-            for i in indexes.flatten():
-                x, y, w, h = boxes[i]
-                # Ensure the bounding box is within the frame
-                x = max(0, x)
-                y = max(0, y)
-                w = min(w, width - x)
-                h = min(h, height - y)
-                # Draw bounding box around detected cat
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                # Add label and confidence
-                label = f"{classes[class_ids[i]]}: {confidences[i]:.2f}"
-                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 
-                            0.5, (0, 255, 0), 2)
-
-        # Show the current frame
-        cv2.imshow('Cat Detection', frame)
+        # Optionally, log frame processing or detections here
 
         # Maintain ~5 FPS by adjusting frame_delay
         elapsed_time = time.time() - loop_start_time
         if elapsed_time < FRAME_DELAY:
             time.sleep(FRAME_DELAY - elapsed_time)
 
-        # Quit on 'q'
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("Quitting...")
-            break
+except KeyboardInterrupt:
+    logging.info("Quitting...")
 
 except Exception as e:
-    print(f"An error occurred: {e}")
+    logging.error(f"An error occurred: {e}")
+
 finally:
     cap.release()
-    cv2.destroyAllWindows()
+    # No need to destroy windows since we're not displaying any
