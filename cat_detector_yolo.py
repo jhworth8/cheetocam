@@ -1,6 +1,8 @@
 import cv2
 import os
 import smtplib
+import imaplib
+import email
 from email.message import EmailMessage
 import time
 from datetime import datetime
@@ -19,7 +21,8 @@ SENDER_PASSWORD = 'bnxh uwio rvhi mevk'  # **Use an App Password if using Gmail*
 
 # Recipient configurations
 PHONE_RECIPIENTS = [
-    '19012672008@tmomail.net'  # T-Mobile MMS gateway
+    '+19012672008@tmomail.net',  # T-Mobile MMS gateway
+    '2486068897@vtext.com'
     # '19018489759@mms.att.net'    # AT&T MMS gateway (commented out)
 ]
 
@@ -41,6 +44,11 @@ names_path = os.path.join(yolo_dir, 'coco.names')
 DETECTION_DURATION = 5     # Seconds of continuous detection before alert
 ALERT_DURATION = 120        # Seconds to wait before sending second alert (Unused now)
 FRAME_DELAY = 0.2           # Delay between frames for ~5 FPS
+
+# IMAP configuration
+IMAP_SERVER = 'imap.gmail.com'
+IMAP_PORT = 993
+EMAIL_CHECK_INTERVAL = 5  # Seconds between email checks (reduced for more frequent checks)
 
 # ==============================
 # Load YOLO Model
@@ -148,11 +156,72 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
         except Exception as e:
             print(f"Failed to send email (MMS) to {recipient}: {e}")
 
+def check_email(cap):
+    """
+    Connects to the email inbox and checks for new emails.
+    For each new email, capture an image and send it back to the sender.
+
+    :param cap: OpenCV VideoCapture object.
+    """
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+        mail.login(SENDER_EMAIL, SENDER_PASSWORD)
+        mail.select('inbox')
+
+        # Search for all unseen emails
+        result, data = mail.search(None, '(UNSEEN)')
+        if result == 'OK':
+            email_ids = data[0].split()
+            for email_id in email_ids:
+                result, msg_data = mail.fetch(email_id, '(RFC822)')
+                if result != 'OK':
+                    print(f"Failed to fetch email ID {email_id}")
+                    continue
+
+                msg = email.message_from_bytes(msg_data[0][1])
+                sender = email.utils.parseaddr(msg['From'])[1]
+                print(f"New email detected from: {sender}")
+
+                # Take a picture
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                image_path = f'email_triggered_{timestamp}.jpg'
+                ret, frame = cap.read()
+                if ret:
+                    cv2.imwrite(image_path, frame)
+                    print(f"Captured image saved: {image_path}")
+                else:
+                    print("Failed to capture image.")
+                    continue
+
+                # Send the captured image back to the sender
+                eastern = timezone('US/Eastern')
+                # timestamp_str = datetime.now(eastern).strftime("%I:%M %p ET")  # This line is no longer needed for subject
+                subject = "Here is what's going on!"  # Updated subject line
+                message = 'Currently outside the door...'
+                send_email_with_attachments(
+                    image_paths=[image_path],
+                    subject=subject,
+                    message=message,
+                    phone_recipients=[],  # No phone recipients in this response
+                    email_recipients=[sender]
+                )
+
+                # Mark the email as seen
+                mail.store(email_id, '+FLAGS', '\\Seen')
+
+        mail.logout()
+    except Exception as e:
+        print(f"Error in checking email: {e}")
+
 # ==============================
 # Initialize Camera
 # ==============================
 
-cap = cv2.VideoCapture(0)  # 0 is typically the default camera
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Use DirectShow backend; adjust as needed
+
+if not cap.isOpened():
+    print("Cannot open camera")
+    exit()
 
 # ==============================
 # Detection State Variables
@@ -160,6 +229,7 @@ cap = cv2.VideoCapture(0)  # 0 is typically the default camera
 
 state = 'waiting'  # Possible states: 'waiting'
 cat_detected_start_time = None
+last_email_check_time = 0  # Track the last time emails were checked
 
 # ==============================
 # Main Detection Loop
@@ -167,14 +237,17 @@ cat_detected_start_time = None
 
 try:
     while True:
-        start_time = time.time()
+        loop_start_time = time.time()
         ret, frame = cap.read()
         if not ret:
             print("Failed to grab frame.")
             break
 
-        # Get current time
+        # Check if it's time to check emails
         current_time = time.time()
+        if current_time - last_email_check_time >= EMAIL_CHECK_INTERVAL:
+            check_email(cap)
+            last_email_check_time = current_time
 
         # Prepare the frame for YOLO
         height, width, channels = frame.shape
@@ -255,12 +328,15 @@ try:
 
                         # Send email (MMS) to phone recipients and email notifications
                         eastern = timezone('US/Eastern')
-                        timestamp_str = datetime.now(eastern).strftime("%I:%M %p ET")
-                        subject = f"Cat Detected at {timestamp_str}!"
+                        # timestamp_str = datetime.now(eastern).strftime("%I:%M %p ET")  # No longer needed for subject
+                        subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
+                        # To change the subject when an email is detected, ensure the subject here is for detection alerts
+                        # Since the user requested changing the subject for email-triggered responses,
+                        # no changes are needed here unless desired
                         message = 'A cat has been detected outside your door!'
                         send_email_with_attachments(
                             image_paths=image_paths,
-                            subject=subject,
+                            subject=subject,  # This is for detection alerts
                             message=message,
                             phone_recipients=PHONE_RECIPIENTS,
                             email_recipients=EMAIL_RECIPIENTS
@@ -293,8 +369,8 @@ try:
         # Show the current frame
         cv2.imshow('Cat Detection', frame)
 
-        # Maintain 5 FPS by adjusting frame_delay
-        elapsed_time = time.time() - start_time
+        # Maintain ~5 FPS by adjusting frame_delay
+        elapsed_time = time.time() - loop_start_time
         if elapsed_time < FRAME_DELAY:
             time.sleep(FRAME_DELAY - elapsed_time)
 
