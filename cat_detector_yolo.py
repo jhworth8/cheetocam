@@ -1,0 +1,310 @@
+import cv2
+import os
+import smtplib
+from email.message import EmailMessage
+import time
+from datetime import datetime
+from pytz import timezone
+import numpy as np
+import requests  # Ensure you have the requests library installed
+import base64
+
+# ==============================
+# Configuration Section
+# ==============================
+
+# Email configuration
+SENDER_EMAIL = 'acatwasdetected@gmail.com'
+SENDER_PASSWORD = 'bnxh uwio rvhi mevk'  # **Use an App Password if using Gmail**
+
+# Recipient configurations
+PHONE_RECIPIENTS = [
+    '19012672008@tmomail.net'  # T-Mobile MMS gateway
+    # '19018489759@mms.att.net'    # AT&T MMS gateway (commented out)
+]
+
+EMAIL_RECIPIENTS = [
+    'jhworth8@gmail.com'        # Additional email recipient
+    # 'cardosie4@gmail.com'      # Additional email recipient (commented out)
+]
+
+# imgbb configuration
+IMGBB_API_KEY = 'e39a6cc3627f4056f727e5bc47b0e051'  # Replace with your actual imgbb API key
+
+# Paths to YOLO files
+yolo_dir = 'yolo'  # Directory where YOLO files are stored
+weights_path = os.path.join(yolo_dir, 'yolov3.weights')
+config_path = os.path.join(yolo_dir, 'yolov3.cfg')
+names_path = os.path.join(yolo_dir, 'coco.names')
+
+# Detection timing configurations
+DETECTION_DURATION = 5     # Seconds of continuous detection before alert
+ALERT_DURATION = 120        # Seconds to wait before sending second alert (Unused now)
+FRAME_DELAY = 0.2           # Delay between frames for ~5 FPS
+
+# ==============================
+# Load YOLO Model
+# ==============================
+
+# Load class names
+with open(names_path, 'r') as f:
+    classes = [line.strip() for line in f.readlines()]
+
+# Ensure 'cat' is in the classes
+if 'cat' not in classes:
+    raise ValueError("'cat' class not found in COCO names.")
+
+# Get the index of 'cat' class
+cat_class_id = classes.index('cat')
+
+# Load YOLO network
+net = cv2.dnn.readNetFromDarknet(config_path, weights_path)
+net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)  # Use CPU; for GPU, adjust accordingly
+
+# Get output layer names
+layer_names = net.getLayerNames()
+# getUnconnectedOutLayers() returns 1-based indices
+output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+
+# ==============================
+# Define Helper Functions
+# ==============================
+
+def upload_image_to_imgbb(image_path, api_key):
+    """
+    Uploads an image to imgbb.com and returns the image URL.
+
+    :param image_path: Path to the image file to upload.
+    :param api_key: Your imgbb API key.
+    :return: Public URL of the uploaded image or None if upload fails.
+    """
+    try:
+        with open(image_path, "rb") as file:
+            encoded_image = base64.b64encode(file.read()).decode('utf-8')
+        
+        payload = {
+            "key": api_key,
+            "image": encoded_image,
+        }
+        
+        response = requests.post("https://api.imgbb.com/1/upload", data=payload, timeout=30)
+        
+        if response.status_code == 200:
+            json_response = response.json()
+            image_url = json_response['data']['url']
+            print(f"Image uploaded to imgbb: {image_url}")
+            return image_url
+        else:
+            print(f"Failed to upload image to imgbb. Status Code: {response.status_code}")
+            print(f"Response: {response.text}")
+            return None
+    except requests.exceptions.Timeout:
+        print("Image upload to imgbb timed out.")
+        return None
+    except Exception as e:
+        print(f"Exception during image upload to imgbb: {e}")
+        return None
+
+def send_email_with_attachments(image_paths, subject, message, phone_recipients, email_recipients):
+    """
+    Sends emails with multiple image attachments to phone and email recipients.
+
+    :param image_paths: List of image file paths to attach.
+    :param subject: Subject of the email.
+    :param message: Body content of the email.
+    :param phone_recipients: List of phone recipient email addresses (Email-to-MMS gateways).
+    :param email_recipients: List of regular email recipient addresses.
+    """
+    # Combine all recipients
+    all_recipients = phone_recipients + email_recipients
+
+    for recipient in all_recipients:
+        msg = EmailMessage()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = recipient
+        msg['Subject'] = subject
+        msg.set_content(message)
+
+        for image_path in image_paths:
+            if not os.path.exists(image_path):
+                print(f"Image path {image_path} does not exist. Skipping attachment.")
+                continue
+
+            with open(image_path, 'rb') as img:
+                img_data = img.read()
+                # Determine image subtype based on file extension
+                _, ext = os.path.splitext(image_path)
+                ext = ext.lower().replace('.', '')
+                if ext not in ['jpg', 'jpeg', 'png']:
+                    ext = 'jpeg'  # Default to jpeg if unknown
+                msg.add_attachment(img_data, maintype='image', subtype=ext, filename=os.path.basename(image_path))
+
+        try:
+            with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.send_message(msg)
+                print(f"Email (MMS) sent to {recipient}! Subject: {subject}")
+        except Exception as e:
+            print(f"Failed to send email (MMS) to {recipient}: {e}")
+
+# ==============================
+# Initialize Camera
+# ==============================
+
+cap = cv2.VideoCapture(0)  # 0 is typically the default camera
+
+# ==============================
+# Detection State Variables
+# ==============================
+
+state = 'waiting'  # Possible states: 'waiting'
+cat_detected_start_time = None
+
+# ==============================
+# Main Detection Loop
+# ==============================
+
+try:
+    while True:
+        start_time = time.time()
+        ret, frame = cap.read()
+        if not ret:
+            print("Failed to grab frame.")
+            break
+
+        # Get current time
+        current_time = time.time()
+
+        # Prepare the frame for YOLO
+        height, width, channels = frame.shape
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+        net.setInput(blob)
+        outputs = net.forward(output_layers)
+
+        # Initialize lists for detected bounding boxes, confidences, and class IDs
+        boxes = []
+        confidences = []
+        class_ids = []
+
+        # Process YOLO detections
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                if class_id == cat_class_id and confidence > 0.5:  # Threshold can be adjusted
+                    # Object detected
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+
+                    # Rectangle coordinates
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+
+                    # Ensure the bounding box is within the frame
+                    x = max(0, x)
+                    y = max(0, y)
+                    w = min(w, width - x)
+                    h = min(h, height - y)
+
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
+
+        # Apply Non-Max Suppression to eliminate redundant overlapping boxes
+        indexes = cv2.dnn.NMSBoxes(boxes, confidences, score_threshold=0.5, nms_threshold=0.4)
+
+        # Determine if a cat is detected in this frame
+        cat_detected = len(indexes) > 0
+
+        if state == 'waiting':
+            if cat_detected:
+                if cat_detected_start_time is None:
+                    cat_detected_start_time = current_time
+                    print("Cat detected. Starting 5-second timer.")
+                else:
+                    elapsed = current_time - cat_detected_start_time
+                    if elapsed >= DETECTION_DURATION:
+                        # Take full-frame picture
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        full_image_path = f'cat_detected_{timestamp}.jpg'
+                        cv2.imwrite(full_image_path, frame)
+                        print("5 seconds of continuous detection. Taking full-frame picture.")
+
+                        # Initialize list of image paths to send
+                        image_paths = [full_image_path]
+
+                        # Save cropped images for each detected cat
+                        for idx, i in enumerate(indexes.flatten()):
+                            x, y, w, h = boxes[i]
+                            cropped_image = frame[y:y+h, x:x+w]
+                            cropped_image_path = f'cat_cropped_{timestamp}_{idx}.jpg'
+                            cv2.imwrite(cropped_image_path, cropped_image)
+                            image_paths.append(cropped_image_path)
+                            print(f"Cropped image saved: {cropped_image_path}")
+
+                        # Optional: Upload images to imgbb and collect URLs
+                        # media_urls = []
+                        # for img_path in image_paths:
+                        #     url = upload_image_to_imgbb(img_path, IMGBB_API_KEY)
+                        #     if url:
+                        #         media_urls.append(url)
+
+                        # Send email (MMS) to phone recipients and email notifications
+                        eastern = timezone('US/Eastern')
+                        timestamp_str = datetime.now(eastern).strftime("%I:%M %p ET")
+                        subject = f"Cat Detected at {timestamp_str}!"
+                        message = 'A cat has been detected outside your door!'
+                        send_email_with_attachments(
+                            image_paths=image_paths,
+                            subject=subject,
+                            message=message,
+                            phone_recipients=PHONE_RECIPIENTS,
+                            email_recipients=EMAIL_RECIPIENTS
+                        )
+
+                        # Update state
+                        state = 'waiting'  # Remain in 'waiting' to allow future detections
+                        cat_detected_start_time = None  # Reset for next detection
+            else:
+                if cat_detected_start_time is not None:
+                    print("Cat no longer detected. Resetting timer.")
+                cat_detected_start_time = None  # Reset timer if cat not detected
+
+        # Draw bounding boxes if any
+        if cat_detected and indexes is not None:
+            for i in indexes.flatten():
+                x, y, w, h = boxes[i]
+                # Ensure the bounding box is within the frame
+                x = max(0, x)
+                y = max(0, y)
+                w = min(w, width - x)
+                h = min(h, height - y)
+                # Draw bounding box around detected cat
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                # Add label and confidence
+                label = f"{classes[class_ids[i]]}: {confidences[i]:.2f}"
+                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 
+                            0.5, (0, 255, 0), 2)
+
+        # Show the current frame
+        cv2.imshow('Cat Detection', frame)
+
+        # Maintain 5 FPS by adjusting frame_delay
+        elapsed_time = time.time() - start_time
+        if elapsed_time < FRAME_DELAY:
+            time.sleep(FRAME_DELAY - elapsed_time)
+
+        # Quit on 'q'
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("Quitting...")
+            break
+
+except Exception as e:
+    print(f"An error occurred: {e}")
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
