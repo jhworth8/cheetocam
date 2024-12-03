@@ -37,12 +37,12 @@ SENDER_PASSWORD = 'bnxh uwio rvhi mevk'  # **Use an App Password if using Gmail*
 PHONE_RECIPIENTS = [
     '+19012672008@tmomail.net',  # T-Mobile MMS gateway
     '2486068897@vtext.com'
-    # '19018489759@mms.att.net'    # AT&T MMS gateway (commented out)
+    '19018489759@mms.att.net'    # AT&T MMS gateway (commented out)
 ]
 
 EMAIL_RECIPIENTS = [
     'jhworth8@gmail.com'        # Additional email recipient
-    # 'cardosie4@gmail.com'      # Additional email recipient (commented out)
+    'cardosie4@gmail.com'      # Additional email recipient (commented out)
 ]
 
 # imgbb configuration
