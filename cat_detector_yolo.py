@@ -33,8 +33,8 @@ IMGBB_API_KEY = 'e39a6cc3627f4056f727e5bc47b0e051'  # Replace with your actual i
 
 # Paths to YOLO files
 yolo_dir = 'yolo'  # Directory where YOLO files are stored
-weights_path = os.path.join(yolo_dir, 'yolov3.weights')
-config_path = os.path.join(yolo_dir, 'yolov3.cfg')
+weights_path = os.path.join(yolo_dir, 'yolov3-tiny.weights')
+config_path = os.path.join(yolo_dir, 'yolov3-tiny.cfg')
 names_path = os.path.join(yolo_dir, 'coco.names')
 
 # Detection timing configurations
