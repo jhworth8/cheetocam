@@ -55,7 +55,7 @@ config_path = os.path.join(yolo_dir, 'yolov3-tiny.cfg')
 names_path = os.path.join(yolo_dir, 'coco.names')
 
 # Detection timing configurations
-DETECTION_DURATION = 5     # Seconds of continuous detection before alert
+DETECTION_DURATION = 3     # Seconds of continuous detection before alert
 ALERT_DURATION = 120        # Seconds to wait before sending second alert (Unused now)
 FRAME_DELAY = 0.2           # Delay between frames for ~5 FPS
 
