@@ -40,7 +40,7 @@ ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_EMAIL_CHECK = int(os.getenv('ENABLE_EMAIL_CHECK', '1'))
 ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
 
-DETECTION_DURATION = int(os.getenv('DETECTION_DURATION', '5'))
+DETECTION_DURATION = int(os.getenv('DETECTION_DURATION', '5'))  # Not really used now but kept for reference
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 EMAIL_CHECK_INTERVAL = int(os.getenv('EMAIL_CHECK_INTERVAL', '5'))
@@ -174,7 +174,6 @@ if not cap.isOpened():
 
 logging.info("Camera initialized. Beginning main loop...")
 
-consecutive_cat_frames = 0
 cooldown_end_time = 0.0
 last_email_check_time = 0.0
 
@@ -191,6 +190,7 @@ try:
             check_email(cap)
             last_email_check_time = current_time
 
+        # Only proceed if cat detection is enabled and cooldown is over
         if ENABLE_CAT_DETECTION and current_time >= cooldown_end_time:
             height, width, _ = frame.shape
             blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
@@ -200,75 +200,69 @@ try:
             boxes = []
             confidences = []
             class_ids = []
+
             for output in outputs:
                 for detection in output:
                     scores = detection[5:]
                     class_id = np.argmax(scores)
                     confidence = scores[class_id]
                     if class_id == cat_class_id and confidence > 0.5:
-                        center_x = int(detection[0] * width)
-                        center_y = int(detection[1] * height)
-                        w = int(detection[2] * width)
-                        h = int(detection[3] * height)
-                        x = max(0, int(center_x - w / 2))
-                        y = max(0, int(center_y - h / 2))
-                        w = min(w, width - x)
-                        h = min(h, height - y)
-                        boxes.append([x, y, w, h])
-                        confidences.append(float(confidence))
-                        class_ids.append(class_id)
+                        # A cat is detected by YOLO. Let's check via Gemini.
+                        logging.info("Cat detected by YOLO. Checking with Gemini...")
 
-            indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-            cat_detected_now = (len(indexes) > 0)
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        full_image_path = f'cat_detected_{timestamp}.jpg'
+                        cv2.imwrite(full_image_path, frame)
 
-            if cat_detected_now:
-                logging.info("Cat detected in current frame.")
-                consecutive_cat_frames += 1
-            else:
-                if consecutive_cat_frames > 0:
-                    logging.info("Cat no longer detected. Resetting consecutive count.")
-                consecutive_cat_frames = 0
+                        # Query Gemini
+                        gemini_response = ""
+                        if ENABLE_GEMINI:
+                            prompt = "What do you see?"
+                            gemini_response = get_gemini_response(full_image_path, prompt)
 
-            # Once we have 3 consecutive detections, consider it confirmed
-            if consecutive_cat_frames >= 2:
-                logging.info("Cat detection confirmed after 1 consecutive detections.")
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                full_image_path = f'cat_detected_{timestamp}.jpg'
-                cv2.imwrite(full_image_path, frame)
-                image_paths = [full_image_path]
+                        # Check if Gemini response contains the word 'cat'
+                        if "cat" in gemini_response.lower():
+                            logging.info("Gemini response indicates a cat. Sending alert email...")
+                            # Extract bounding boxes for the detected cat
+                            center_x = int(detection[0] * width)
+                            center_y = int(detection[1] * height)
+                            w = int(detection[2] * width)
+                            h = int(detection[3] * height)
+                            x = max(0, int(center_x - w / 2))
+                            y = max(0, int(center_y - h / 2))
+                            w = min(w, width - x)
+                            h = min(h, height - y)
 
-                cropped_image_paths = []
-                for i in indexes:
-                    x, y, w, h = boxes[i]
-                    cropped = frame[y:y+h, x:x+w]
-                    cropped_image_path = f'cat_cropped_{timestamp}_{i}.jpg'
-                    cv2.imwrite(cropped_image_path, cropped)
-                    image_paths.append(cropped_image_path)
-                    cropped_image_paths.append(cropped_image_path)
+                            image_paths = [full_image_path]
+                            cropped_image = frame[y:y+h, x:x+w]
+                            cropped_image_path = f'cat_cropped_{timestamp}_0.jpg'
+                            cv2.imwrite(cropped_image_path, cropped_image)
+                            image_paths.append(cropped_image_path)
 
+                            eastern = timezone('US/Eastern')
+                            subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
+                            message = "A cat has been detected outside your door!"
+                            if gemini_response:
+                                message += f"\n\nGemini Response:\n{gemini_response}"
 
-                gemini_response = ""
-                if ENABLE_GEMINI and cropped_image_paths:
-                    prompt = "This is an image of a cat detection camera! What do you see? Short sentences."
-                    gemini_response = get_gemini_response(cropped_image_paths[0], prompt)
+                            send_email_with_attachments(
+                                image_paths=image_paths,
+                                subject=subject,
+                                message=message,
+                                phone_recipients=PHONE_RECIPIENTS,
+                                email_recipients=EMAIL_RECIPIENTS
+                            )
 
-                eastern = timezone('US/Eastern')
-                subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
-                message = "A cat has been detected outside your door!"
-                if gemini_response:
-                    message += f"\n\nGemini Response:\n{gemini_response}"
+                            # Start cooldown
+                            cooldown_end_time = current_time + COOLDOWN_DURATION
 
-                send_email_with_attachments(
-                    image_paths=image_paths,
-                    subject=subject,
-                    message=message,
-                    phone_recipients=PHONE_RECIPIENTS,
-                    email_recipients=EMAIL_RECIPIENTS
-                )
-
-                # Start cooldown and reset consecutive count
-                cooldown_end_time = current_time + COOLDOWN_DURATION
-                consecutive_cat_frames = 0
+                        # Since we only need to process one detection at a time, we can break out after handling
+                        break
+                else:
+                    # Continue if inner loop not broken
+                    continue
+                # Inner loop was broken, break outer loop
+                break
 
         elapsed_time = time.time() - start_loop
         if elapsed_time < FRAME_DELAY:
