@@ -148,7 +148,7 @@ def check_email(cap):
 
                         eastern = timezone('US/Eastern')
                         subject = "Here's what's going on!"
-                        message = 'Current situation outside the door...'
+                        message = 'Currently outside the door...'
                         if gemini_response:
                             message += f"\n\nGemini Response:\n{gemini_response}"
                         send_email_with_attachments(
