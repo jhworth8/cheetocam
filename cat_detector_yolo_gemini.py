@@ -228,8 +228,15 @@ try:
             # Check if state changed
             if cat_detected_now != last_cat_state:
                 toggle_count += 1
-                logging.info(f"Cat detection state changed: {last_cat_state} -> {cat_detected_now}, toggles={toggle_count}")
+                # Determine descriptive states
+                state_from = "Detected" if last_cat_state else "Not Detected"
+                state_to = "Detected" if cat_detected_now else "Not Detected"
+                
+                # Log the state change with descriptive terms
+                logging.info(f"Cat detection state changed from {state_from} to {state_to}. Toggle count: {toggle_count}")
+                
                 last_cat_state = cat_detected_now
+
 
             # Once toggles reach 3, consider it a final detection event
             if toggle_count >= 3:
