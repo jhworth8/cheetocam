@@ -238,15 +238,14 @@ try:
                 image_paths = [full_image_path]
 
                 cropped_image_paths = []
-                # Iterate over indexes correctly
-                for idx in indexes:
-                    i = idx[0]
+                for i in indexes:
                     x, y, w, h = boxes[i]
                     cropped = frame[y:y+h, x:x+w]
                     cropped_image_path = f'cat_cropped_{timestamp}_{i}.jpg'
                     cv2.imwrite(cropped_image_path, cropped)
                     image_paths.append(cropped_image_path)
                     cropped_image_paths.append(cropped_image_path)
+
 
                 gemini_response = ""
                 if ENABLE_GEMINI and cropped_image_paths:
