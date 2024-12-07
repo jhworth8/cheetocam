@@ -40,7 +40,7 @@ ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_EMAIL_CHECK = int(os.getenv('ENABLE_EMAIL_CHECK', '1'))
 ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
 
-DETECTION_DURATION = int(os.getenv('DETECTION_DURATION', '5'))  # Not really used now but kept for reference
+DETECTION_DURATION = int(os.getenv('DETECTION_DURATION', '5'))  # Not used now since consecutive logic is removed
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 EMAIL_CHECK_INTERVAL = int(os.getenv('EMAIL_CHECK_INTERVAL', '5'))
@@ -139,10 +139,9 @@ def check_email(cap):
                         image_path = f'email_triggered_{timestamp}.jpg'
                         cv2.imwrite(image_path, frame)
                         logging.info(f"Captured image: {image_path}")
-                        # Process with Gemini if enabled
                         gemini_response = ""
                         if ENABLE_GEMINI:
-                            prompt = "This is an image captured in response to your email inquiry. Describe what you see in short sentences."
+                            prompt = "This is an image captured in response to your email inquiry. Describe what you see? Short sentences."
                             gemini_response = get_gemini_response(image_path, prompt)
 
                         eastern = timezone('US/Eastern')
@@ -190,7 +189,6 @@ try:
             check_email(cap)
             last_email_check_time = current_time
 
-        # Only proceed if cat detection is enabled and cooldown is over
         if ENABLE_CAT_DETECTION and current_time >= cooldown_end_time:
             height, width, _ = frame.shape
             blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
@@ -200,69 +198,69 @@ try:
             boxes = []
             confidences = []
             class_ids = []
-
             for output in outputs:
                 for detection in output:
                     scores = detection[5:]
                     class_id = np.argmax(scores)
                     confidence = scores[class_id]
                     if class_id == cat_class_id and confidence > 0.5:
-                        # A cat is detected by YOLO. Let's check via Gemini.
-                        logging.info("Cat detected by YOLO. Checking with Gemini...")
+                        center_x = int(detection[0] * width)
+                        center_y = int(detection[1] * height)
+                        w = int(detection[2] * width)
+                        h = int(detection[3] * height)
+                        x = max(0, int(center_x - w / 2))
+                        y = max(0, int(center_y - h / 2))
+                        w = min(w, width - x)
+                        h = min(h, height - y)
+                        boxes.append([x, y, w, h])
+                        confidences.append(float(confidence))
+                        class_ids.append(class_id)
 
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        full_image_path = f'cat_detected_{timestamp}.jpg'
-                        cv2.imwrite(full_image_path, frame)
+            indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+            cat_detected_now = (len(indexes) > 0)
 
-                        # Query Gemini
-                        gemini_response = ""
-                        if ENABLE_GEMINI:
-                            prompt = "What do you see?"
-                            gemini_response = get_gemini_response(full_image_path, prompt)
+            # If cat detected by YOLO, confirm with Gemini
+            if cat_detected_now:
+                logging.info("Cat detected by YOLO. Sending image to Gemini for confirmation...")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                full_image_path = f'cat_detected_{timestamp}.jpg'
+                cv2.imwrite(full_image_path, frame)
 
-                        # Check if Gemini response contains the word 'cat'
-                        if "cat" in gemini_response.lower():
-                            logging.info("Gemini response indicates a cat. Sending alert email...")
-                            # Extract bounding boxes for the detected cat
-                            center_x = int(detection[0] * width)
-                            center_y = int(detection[1] * height)
-                            w = int(detection[2] * width)
-                            h = int(detection[3] * height)
-                            x = max(0, int(center_x - w / 2))
-                            y = max(0, int(center_y - h / 2))
-                            w = min(w, width - x)
-                            h = min(h, height - y)
+                gemini_response = ""
+                if ENABLE_GEMINI:
+                    prompt = "What do you see?"
+                    gemini_response = get_gemini_response(full_image_path, prompt)
 
-                            image_paths = [full_image_path]
-                            cropped_image = frame[y:y+h, x:x+w]
-                            cropped_image_path = f'cat_cropped_{timestamp}_0.jpg'
-                            cv2.imwrite(cropped_image_path, cropped_image)
-                            image_paths.append(cropped_image_path)
+                # Check if Gemini response contains "cat"
+                if "cat" in gemini_response.lower():
+                    logging.info("Gemini also sees a cat. Sending alerts...")
+                    image_paths = [full_image_path]
 
-                            eastern = timezone('US/Eastern')
-                            subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
-                            message = "A cat has been detected outside your door!"
-                            if gemini_response:
-                                message += f"\n\nGemini Response:\n{gemini_response}"
+                    cropped_image_paths = []
+                    for i in indexes:
+                        x, y, w, h = boxes[i]
+                        cropped = frame[y:y+h, x:x+w]
+                        cropped_image_path = f'cat_cropped_{timestamp}_{i}.jpg'
+                        cv2.imwrite(cropped_image_path, cropped)
+                        image_paths.append(cropped_image_path)
+                        cropped_image_paths.append(cropped_image_path)
 
-                            send_email_with_attachments(
-                                image_paths=image_paths,
-                                subject=subject,
-                                message=message,
-                                phone_recipients=PHONE_RECIPIENTS,
-                                email_recipients=EMAIL_RECIPIENTS
-                            )
+                    eastern = timezone('US/Eastern')
+                    subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
+                    message = "A cat has been detected outside your door!"
+                    if gemini_response:
+                        message += f"\n\nGemini Response:\n{gemini_response}"
 
-                            # Start cooldown
-                            cooldown_end_time = current_time + COOLDOWN_DURATION
+                    send_email_with_attachments(
+                        image_paths=image_paths,
+                        subject=subject,
+                        message=message,
+                        phone_recipients=PHONE_RECIPIENTS,
+                        email_recipients=EMAIL_RECIPIENTS
+                    )
 
-                        # Since we only need to process one detection at a time, we can break out after handling
-                        break
-                else:
-                    # Continue if inner loop not broken
-                    continue
-                # Inner loop was broken, break outer loop
-                break
+                    # Start cooldown
+                    cooldown_end_time = current_time + COOLDOWN_DURATION
 
         elapsed_time = time.time() - start_loop
         if elapsed_time < FRAME_DELAY:
