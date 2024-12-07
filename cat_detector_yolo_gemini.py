@@ -32,7 +32,6 @@ SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
 PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
 EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
-IMGBB_API_KEY = os.getenv('IMGBB_API_KEY')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))

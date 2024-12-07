@@ -29,7 +29,6 @@ SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
 PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
 EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
-IMGBB_API_KEY = os.getenv('IMGBB_API_KEY')
 YOLO_DIR = os.getenv('YOLO_DIR', 'yolo')
 
 DETECTION_DURATION = float(os.getenv('DETECTION_DURATION', '3'))
@@ -57,34 +56,6 @@ net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
 net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 layer_names = net.getLayerNames()
 output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
-
-def upload_image_to_imgbb(image_path, api_key):
-    try:
-        with open(image_path, "rb") as file:
-            encoded_image = base64.b64encode(file.read()).decode('utf-8')
-
-        payload = {
-            "key": api_key,
-            "image": encoded_image,
-        }
-
-        response = requests.post("https://api.imgbb.com/1/upload", data=payload, timeout=30)
-
-        if response.status_code == 200:
-            json_response = response.json()
-            image_url = json_response['data']['url']
-            logging.info(f"Image uploaded to imgbb: {image_url}")
-            return image_url
-        else:
-            logging.error(f"Failed to upload image to imgbb. Status Code: {response.status_code}")
-            logging.error(f"Response: {response.text}")
-            return None
-    except requests.exceptions.Timeout:
-        logging.error("Image upload to imgbb timed out.")
-        return None
-    except Exception as e:
-        logging.error(f"Exception during image upload to imgbb: {e}")
-        return None
 
 def send_email_with_attachments(image_paths, subject, message, phone_recipients, email_recipients):
     all_recipients = phone_recipients + email_recipients
