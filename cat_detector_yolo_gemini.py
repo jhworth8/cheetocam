@@ -163,19 +163,20 @@ def check_email(cap):
         logging.error(f"Email check error: {e}")
 
 # Initialize camera
-# cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # For Windows
-cap = cv2.VideoCapture("/dev/video0") # For Raspberry Pi
+# For Windows:
+# cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+
+# For Raspberry Pi:
+cap = cv2.VideoCapture("/dev/video0")
 if not cap.isOpened():
     logging.error("Cannot open camera")
     exit()
 
-# Variables for toggling detection states
-last_cat_state = False
-toggle_count = 0
+logging.info("Camera initialized. Beginning main loop...")
+
+consecutive_cat_frames = 0
 cooldown_end_time = 0.0
 last_email_check_time = 0.0
-
-logging.info("Camera initialized. Beginning main loop...")
 
 try:
     while True:
@@ -220,36 +221,29 @@ try:
             indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
             cat_detected_now = (len(indexes) > 0)
 
-            # Log the detection state
             if cat_detected_now:
                 logging.info("Cat detected in current frame.")
+                consecutive_cat_frames += 1
+            else:
+                if consecutive_cat_frames > 0:
+                    logging.info("Cat no longer detected. Resetting consecutive count.")
+                consecutive_cat_frames = 0
 
-            # Check if state changed
-            if cat_detected_now != last_cat_state:
-                toggle_count += 1
-                # Determine descriptive states
-                state_from = "Detected" if last_cat_state else "Not Detected"
-                state_to = "Detected" if cat_detected_now else "Not Detected"
-                
-                # Log the state change with descriptive terms
-                logging.info(f"Cat detection state changed from {state_from} to {state_to}. Toggle count: {toggle_count}")
-                
-                last_cat_state = cat_detected_now
-
-
-            # Once toggles reach 3, consider it a final detection event
-            if toggle_count >= 3:
-                logging.info("Cat detection confirmed after 3 toggles.")
+            # Once we have 3 consecutive detections, consider it confirmed
+            if consecutive_cat_frames >= 3:
+                logging.info("Cat detection confirmed after 3 consecutive detections.")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 full_image_path = f'cat_detected_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
                 image_paths = [full_image_path]
 
                 cropped_image_paths = []
-                for idx, i in enumerate(indexes.flatten()):
+                # Iterate over indexes correctly
+                for idx in indexes:
+                    i = idx[0]
                     x, y, w, h = boxes[i]
                     cropped = frame[y:y+h, x:x+w]
-                    cropped_image_path = f'cat_cropped_{timestamp}_{idx}.jpg'
+                    cropped_image_path = f'cat_cropped_{timestamp}_{i}.jpg'
                     cv2.imwrite(cropped_image_path, cropped)
                     image_paths.append(cropped_image_path)
                     cropped_image_paths.append(cropped_image_path)
@@ -273,8 +267,9 @@ try:
                     email_recipients=EMAIL_RECIPIENTS
                 )
 
+                # Start cooldown and reset consecutive count
                 cooldown_end_time = current_time + COOLDOWN_DURATION
-                toggle_count = 0  # Reset toggle count after final detection
+                consecutive_cat_frames = 0
 
         elapsed_time = time.time() - start_loop
         if elapsed_time < FRAME_DELAY:
