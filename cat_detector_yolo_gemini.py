@@ -230,8 +230,8 @@ try:
                 consecutive_cat_frames = 0
 
             # Once we have 3 consecutive detections, consider it confirmed
-            if consecutive_cat_frames >= 3:
-                logging.info("Cat detection confirmed after 3 consecutive detections.")
+            if consecutive_cat_frames >= 2:
+                logging.info("Cat detection confirmed after 1 consecutive detections.")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 full_image_path = f'cat_detected_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
