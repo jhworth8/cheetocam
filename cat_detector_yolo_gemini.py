@@ -103,7 +103,7 @@ def get_gemini_response(image_path, prompt):
         return ""
     try:
         sample_file = PIL.Image.open(image_path)
-        model = genai.GenerativeModel(model_name="gemini-1.5-pro")
+        model = genai.GenerativeModel(model_name="gemini-2.0-flash-001")
         response = model.generate_content([prompt, sample_file])
         logging.info("Gemini response received.")
         return response.text
