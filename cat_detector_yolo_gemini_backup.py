@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import cv2
 import os
 import smtplib
@@ -15,13 +14,9 @@ import logging
 import PIL.Image
 import google.generativeai as genai
 from dotenv import load_dotenv
-import firebase_admin
-from firebase_admin import credentials, db
 
-# Load environment variables
 load_dotenv()
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -31,9 +26,8 @@ logging.basicConfig(
     ]
 )
 
-logging.info("Starting cat detection system with Firebase integration...")
+logging.info("Starting cat detection system...")
 
-# Email and API configuration
 SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
 PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
@@ -45,14 +39,12 @@ ENABLE_EMAIL_RESPONSE = int(os.getenv('ENABLE_EMAIL_RESPONSE', '1'))
 ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_EMAIL_CHECK = int(os.getenv('ENABLE_EMAIL_CHECK', '1'))
 ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
-ENABLE_FIREBASE_UPLOAD = int(os.getenv('ENABLE_FIREBASE_UPLOAD', '1'))  # New flag for Firebase
 
 DETECTION_DURATION = int(os.getenv('DETECTION_DURATION', '5'))  # Not used now since consecutive logic is removed
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 EMAIL_CHECK_INTERVAL = int(os.getenv('EMAIL_CHECK_INTERVAL', '5'))
 
-# YOLO configuration paths
 yolo_dir = os.getenv('YOLO_DIR', 'yolo')
 weights_path = os.path.join(yolo_dir, 'yolov3-tiny.weights')
 config_path = os.path.join(yolo_dir, 'yolov3-tiny.cfg')
@@ -61,23 +53,9 @@ names_path = os.path.join(yolo_dir, 'coco.names')
 IMAP_SERVER = 'imap.gmail.com'
 IMAP_PORT = 993
 
-# Initialize Gemini API if enabled
 if ENABLE_GEMINI:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Initialize Firebase Admin SDK
-if ENABLE_FIREBASE_UPLOAD:
-    try:
-        cred = credentials.Certificate('serviceAccountKey.json')
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://cat-detector-77f57.firebaseio.com/'
-        })
-        logging.info("Firebase initialized successfully.")
-    except Exception as e:
-        logging.error(f"Firebase initialization failed: {e}")
-        ENABLE_FIREBASE_UPLOAD = 0
-
-# Initialize YOLO for cat detection
 if ENABLE_CAT_DETECTION:
     with open(names_path, 'r') as f:
         classes = [line.strip() for line in f.readlines()]
@@ -183,42 +161,10 @@ def check_email(cap):
     except Exception as e:
         logging.error(f"Email check error: {e}")
 
-def upload_detection_to_firebase(timestamp, gemini_response, main_image_path, cropped_image_paths):
-    if not ENABLE_FIREBASE_UPLOAD:
-        return
-    try:
-        # Encode main image to base64
-        with open(main_image_path, 'rb') as f:
-            image_data = f.read()
-        image_base64 = base64.b64encode(image_data).decode('utf-8')
-        
-        # Process cropped images
-        cropped_images = []
-        for path in cropped_image_paths:
-            with open(path, 'rb') as f:
-                crop_data = f.read()
-            crop_base64 = base64.b64encode(crop_data).decode('utf-8')
-            cropped_images.append({
-                'filename': os.path.basename(path),
-                'image': crop_base64
-            })
-        
-        detection_data = {
-            'timestamp': timestamp,
-            'gemini_response': gemini_response,
-            'main_image': image_base64,
-            'cropped_images': cropped_images
-        }
-        
-        ref = db.reference('detections')
-        new_ref = ref.push(detection_data)
-        logging.info(f"Detection uploaded to Firebase with key: {new_ref.key}")
-    except Exception as e:
-        logging.error(f"Error uploading to Firebase: {e}")
-
 # Initialize camera
 # For Windows:
 # cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+
 # For Raspberry Pi:
 cap = cv2.VideoCapture("/dev/video0")
 if not cap.isOpened():
@@ -273,6 +219,7 @@ try:
             indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
             cat_detected_now = (len(indexes) > 0)
 
+            # If cat detected by YOLO, confirm with Gemini
             if cat_detected_now:
                 logging.info("Cat detected by YOLO. Sending image to Gemini for confirmation...")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -284,8 +231,9 @@ try:
                     prompt = "What do you see?"
                     gemini_response = get_gemini_response(full_image_path, prompt)
 
+                # Check if Gemini response contains "cat"
                 if "cat" in gemini_response.lower():
-                    logging.info("Gemini also sees a cat. Sending alerts and uploading to Firebase...")
+                    logging.info("Gemini also sees a cat. Sending alerts...")
                     image_paths = [full_image_path]
 
                     cropped_image_paths = []
@@ -311,10 +259,7 @@ try:
                         email_recipients=EMAIL_RECIPIENTS
                     )
 
-                    # Upload detection data to Firebase
-                    upload_detection_to_firebase(timestamp, gemini_response, full_image_path, cropped_image_paths)
-
-                    # Start cooldown period
+                    # Start cooldown
                     cooldown_end_time = current_time + COOLDOWN_DURATION
 
         elapsed_time = time.time() - start_loop
