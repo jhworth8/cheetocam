@@ -69,9 +69,7 @@ if ENABLE_GEMINI:
 if ENABLE_FIREBASE_UPLOAD:
     try:
         cred = credentials.Certificate('serviceAccountKey.json')
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://cat-detector-77f57-default-rtdb.firebaseio.com/'
-        })
+        firebase_admin.initialize_app(cred)
         logging.info("Firebase initialized successfully.")
     except Exception as e:
         logging.error(f"Firebase initialization failed: {e}")
