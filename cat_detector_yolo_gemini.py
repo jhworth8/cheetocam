@@ -47,7 +47,6 @@ ENABLE_EMAIL_CHECK = int(os.getenv('ENABLE_EMAIL_CHECK', '1'))
 ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
 ENABLE_FIREBASE_UPLOAD = int(os.getenv('ENABLE_FIREBASE_UPLOAD', '1'))  # New flag for Firebase
 
-DETECTION_DURATION = int(os.getenv('DETECTION_DURATION', '5'))  # Not used now since consecutive logic is removed
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 EMAIL_CHECK_INTERVAL = int(os.getenv('EMAIL_CHECK_INTERVAL', '5'))
@@ -76,7 +75,6 @@ if ENABLE_FIREBASE_UPLOAD:
     except Exception as e:
         logging.error(f"Firebase initialization failed: {e}")
         ENABLE_FIREBASE_UPLOAD = 0
-
 
 # Initialize YOLO for cat detection
 if ENABLE_CAT_DETECTION:
@@ -164,7 +162,8 @@ def check_email(cap):
                         logging.info(f"Captured image: {image_path}")
                         gemini_response = ""
                         if ENABLE_GEMINI:
-                            prompt = "This is an image captured in response to your email inquiry. Describe what you see? Short sentences."
+                            prompt = ("This image was captured in response to your inquiry. "
+                                      "Please provide a clear and concise description of what you see. Use short sentences.")
                             gemini_response = get_gemini_response(image_path, prompt)
 
                         eastern = timezone('US/Eastern')
@@ -184,7 +183,7 @@ def check_email(cap):
     except Exception as e:
         logging.error(f"Email check error: {e}")
 
-def upload_detection_to_firebase(timestamp, gemini_response, main_image_path, cropped_image_paths):
+def upload_detection_to_firebase(timestamp, gemini_response, main_image_path):
     if not ENABLE_FIREBASE_UPLOAD:
         return
     try:
@@ -193,22 +192,10 @@ def upload_detection_to_firebase(timestamp, gemini_response, main_image_path, cr
             image_data = f.read()
         image_base64 = base64.b64encode(image_data).decode('utf-8')
         
-        # Process cropped images
-        cropped_images = []
-        for path in cropped_image_paths:
-            with open(path, 'rb') as f:
-                crop_data = f.read()
-            crop_base64 = base64.b64encode(crop_data).decode('utf-8')
-            cropped_images.append({
-                'filename': os.path.basename(path),
-                'image': crop_base64
-            })
-        
         detection_data = {
             'timestamp': timestamp,
             'gemini_response': gemini_response,
-            'main_image': image_base64,
-            'cropped_images': cropped_images
+            'main_image': image_base64
         }
         
         ref = db.reference('detections')
@@ -282,21 +269,13 @@ try:
 
                 gemini_response = ""
                 if ENABLE_GEMINI:
-                    prompt = "What do you see?"
+                    prompt = ("Please provide a clear and concise description of the scene captured. "
+                              "Use short sentences to describe what you see.")
                     gemini_response = get_gemini_response(full_image_path, prompt)
 
                 if "cat" in gemini_response.lower():
-                    logging.info("Gemini also sees a cat. Sending alerts and uploading to Firebase...")
+                    logging.info("Gemini confirmed the presence of a cat. Sending alerts and uploading to Firebase...")
                     image_paths = [full_image_path]
-
-                    cropped_image_paths = []
-                    for i in indexes:
-                        x, y, w, h = boxes[i]
-                        cropped = frame[y:y+h, x:x+w]
-                        cropped_image_path = f'cat_cropped_{timestamp}_{i}.jpg'
-                        cv2.imwrite(cropped_image_path, cropped)
-                        image_paths.append(cropped_image_path)
-                        cropped_image_paths.append(cropped_image_path)
 
                     eastern = timezone('US/Eastern')
                     subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
@@ -312,8 +291,8 @@ try:
                         email_recipients=EMAIL_RECIPIENTS
                     )
 
-                    # Upload detection data to Firebase
-                    upload_detection_to_firebase(timestamp, gemini_response, full_image_path, cropped_image_paths)
+                    # Upload detection data (only main image) to Firebase
+                    upload_detection_to_firebase(timestamp, gemini_response, full_image_path)
 
                     # Start cooldown period
                     cooldown_end_time = current_time + COOLDOWN_DURATION
