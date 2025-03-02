@@ -68,7 +68,7 @@ if ENABLE_GEMINI:
 # Initialize Firebase Admin SDK
 if ENABLE_FIREBASE_UPLOAD:
     try:
-        cred = credentials.Certificate('cat-detector-77f57-firebase-adminsdk-fbsvc-91f08a2076.json')
+        cred = credentials.Certificate('serviceAccountKey.json')
         firebase_admin.initialize_app(cred, {
             'databaseURL': 'https://cat-detector-77f57-default-rtdb.firebaseio.com/'
         })
