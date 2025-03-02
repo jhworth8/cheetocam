@@ -70,7 +70,7 @@ if ENABLE_FIREBASE_UPLOAD:
     try:
         cred = credentials.Certificate('cat-detector-77f57-firebase-adminsdk-fbsvc-91f08a2076.json')
         firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://cat-detector-77f57.firebaseio.com/'
+            'databaseURL': 'https://cat-detector-77f57-default-rtdb.firebaseio.com/'
         })
         logging.info("Firebase initialized successfully.")
     except Exception as e:
