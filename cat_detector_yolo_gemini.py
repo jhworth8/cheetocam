@@ -45,7 +45,7 @@ ENABLE_EMAIL_RESPONSE = int(os.getenv('ENABLE_EMAIL_RESPONSE', '1'))
 ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_EMAIL_CHECK = int(os.getenv('ENABLE_EMAIL_CHECK', '1'))
 ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
-ENABLE_FIREBASE_UPLOAD = int(os.getenv('ENABLE_FIREBASE_UPLOAD', '1'))  # New flag for Firebase
+ENABLE_FIREBASE_UPLOAD = int(os.getenv('ENABLE_FIREBASE_UPLOAD', '1'))
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
@@ -165,7 +165,6 @@ def check_email(cap):
                             prompt = ("This image was captured in response to your inquiry. "
                                       "Please provide a clear and concise description of what you see. Use short sentences.")
                             gemini_response = get_gemini_response(image_path, prompt)
-
                         eastern = timezone('US/Eastern')
                         subject = "Here's what's going on!"
                         message = 'Currently outside the door...'
@@ -183,16 +182,14 @@ def check_email(cap):
     except Exception as e:
         logging.error(f"Email check error: {e}")
 
-# UPDATED: Include an epoch timestamp with the detection event.
+# Upload detection event to Firebase with epoch timestamp included
 def upload_detection_to_firebase(timestamp, gemini_response, main_image_path):
     if not ENABLE_FIREBASE_UPLOAD:
         return
     try:
-        # Encode main image to base64
         with open(main_image_path, 'rb') as f:
             image_data = f.read()
         image_base64 = base64.b64encode(image_data).decode('utf-8')
-        # Get current Unix epoch time for timeline calculations
         epoch = time.time()
         detection_data = {
             'timestamp': timestamp,
@@ -206,10 +203,7 @@ def upload_detection_to_firebase(timestamp, gemini_response, main_image_path):
     except Exception as e:
         logging.error(f"Error uploading to Firebase: {e}")
 
-# Initialize camera
-# For Windows:
-# cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-# For Raspberry Pi:
+# Initialize camera (modify as needed for your platform)
 cap = cv2.VideoCapture("/dev/video0")
 if not cap.isOpened():
     logging.error("Cannot open camera")
@@ -264,7 +258,7 @@ try:
             cat_detected_now = (len(indexes) > 0)
 
             if cat_detected_now:
-                logging.info("Cat detected by YOLO. Sending image to Gemini for confirmation...")
+                logging.info("Cat detected by YOLO. Processing detection...")
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 full_image_path = f'cat_detected_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
@@ -276,27 +270,15 @@ try:
                     gemini_response = get_gemini_response(full_image_path, prompt)
 
                 if "cat" in gemini_response.lower():
-                    logging.info("Gemini confirmed the presence of a cat. Sending alerts and uploading to Firebase...")
-                    image_paths = [full_image_path]
-
-                    eastern = timezone('US/Eastern')
-                    subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
-                    message = "A cat has been detected outside your door!"
-                    if gemini_response:
-                        message += f"\n\nGemini Response:\n{gemini_response}"
-
+                    logging.info("Gemini confirmed the presence of a cat. Uploading detection to Firebase...")
                     send_email_with_attachments(
-                        image_paths=image_paths,
-                        subject=subject,
-                        message=message,
+                        image_paths=[full_image_path],
+                        subject=f"Cat Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}",
+                        message="A cat has been detected outside your door!\n\n" + gemini_response,
                         phone_recipients=PHONE_RECIPIENTS,
                         email_recipients=EMAIL_RECIPIENTS
                     )
-
-                    # Upload detection data (with epoch timestamp) to Firebase
                     upload_detection_to_firebase(timestamp, gemini_response, full_image_path)
-
-                    # Start cooldown period
                     cooldown_end_time = current_time + COOLDOWN_DURATION
 
         elapsed_time = time.time() - start_loop
