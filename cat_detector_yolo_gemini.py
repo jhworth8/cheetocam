@@ -39,6 +39,7 @@ SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
 PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
 EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')  # New weather API key
 
 ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))
 ENABLE_EMAIL_RESPONSE = int(os.getenv('ENABLE_EMAIL_RESPONSE', '1'))
@@ -90,6 +91,24 @@ if ENABLE_CAT_DETECTION:
     layer_names = net.getLayerNames()
     output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
 
+def fetch_weather_data():
+    """Fetch current weather data from OpenWeatherMap."""
+    try:
+        lat = os.getenv('WEATHER_LAT', '42.5467')
+        lon = os.getenv('WEATHER_LON', '-83.2113')
+        url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={OPENWEATHER_API_KEY}&units=imperial"
+        response = requests.get(url, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        temp = data['main']['temp']
+        weather = data['weather'][0]['main']
+        icon = data['weather'][0]['icon']
+        logging.info(f"Fetched weather: {temp} °F, {weather}")
+        return temp, weather, icon
+    except Exception as e:
+        logging.error(f"Error fetching weather data: {e}")
+        return None, None, None
+
 def send_email_with_attachments(image_paths, subject, message, phone_recipients, email_recipients):
     if not ENABLE_ALERT_SENDING:
         return
@@ -132,6 +151,29 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
+def upload_detection_to_firebase(timestamp, gemini_response, main_image_path, detectionTemp=None, detectionWeather=None, detectionIcon=None):
+    if not ENABLE_FIREBASE_UPLOAD:
+        return
+    try:
+        with open(main_image_path, 'rb') as f:
+            image_data = f.read()
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        epoch = time.time()
+        detection_data = {
+            'timestamp': timestamp,
+            'epoch': epoch,
+            'gemini_response': gemini_response,
+            'main_image': image_base64,
+            'detectionTemp': detectionTemp,
+            'detectionWeather': detectionWeather,
+            'detectionIcon': detectionIcon
+        }
+        ref = db.reference('detections')
+        new_ref = ref.push(detection_data)
+        logging.info(f"Detection uploaded to Firebase with key: {new_ref.key}")
+    except Exception as e:
+        logging.error(f"Error uploading to Firebase: {e}")
+
 def check_email(cap):
     if not ENABLE_EMAIL_CHECK:
         return
@@ -165,11 +207,15 @@ def check_email(cap):
                             prompt = ("This image was captured in response to your inquiry. "
                                       "Please provide a clear and concise description of what you see. Use short sentences.")
                             gemini_response = get_gemini_response(image_path, prompt)
+                        # Fetch weather data for email-triggered detection
+                        temp, weather, icon = fetch_weather_data()
                         eastern = timezone('US/Eastern')
                         subject = "Here's what's going on!"
-                        message = 'Currently outside the door...'
+                        message = "Currently outside the door...\n"
                         if gemini_response:
-                            message += f"\n\nGemini Response:\n{gemini_response}"
+                            message += f"\nGemini Response:\n{gemini_response}"
+                        if temp and weather:
+                            message += f"\nWeather: {temp} °F, {weather}"
                         send_email_with_attachments(
                             image_paths=[image_path],
                             subject=subject,
@@ -177,31 +223,12 @@ def check_email(cap):
                             phone_recipients=[],
                             email_recipients=[sender]
                         )
+                        # Optionally upload this detection to Firebase with weather data
+                        upload_detection_to_firebase(timestamp, gemini_response, image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                 mail.store(email_id, '+FLAGS', '\\Seen')
         mail.logout()
     except Exception as e:
         logging.error(f"Email check error: {e}")
-
-# Upload detection event to Firebase with epoch timestamp included
-def upload_detection_to_firebase(timestamp, gemini_response, main_image_path):
-    if not ENABLE_FIREBASE_UPLOAD:
-        return
-    try:
-        with open(main_image_path, 'rb') as f:
-            image_data = f.read()
-        image_base64 = base64.b64encode(image_data).decode('utf-8')
-        epoch = time.time()
-        detection_data = {
-            'timestamp': timestamp,
-            'epoch': epoch,
-            'gemini_response': gemini_response,
-            'main_image': image_base64
-        }
-        ref = db.reference('detections')
-        new_ref = ref.push(detection_data)
-        logging.info(f"Detection uploaded to Firebase with key: {new_ref.key}")
-    except Exception as e:
-        logging.error(f"Error uploading to Firebase: {e}")
 
 # Initialize camera (modify as needed for your platform)
 cap = cv2.VideoCapture("/dev/video0")
@@ -269,16 +296,19 @@ try:
                               "Use short sentences to describe what you see.")
                     gemini_response = get_gemini_response(full_image_path, prompt)
 
-                if "cat" in gemini_response.lower():
+                # Fetch weather data when a detection is captured
+                temp, weather, icon = fetch_weather_data()
+
+                if gemini_response and "cat" in gemini_response.lower():
                     logging.info("Gemini confirmed the presence of a cat. Uploading detection to Firebase...")
                     send_email_with_attachments(
                         image_paths=[full_image_path],
                         subject=f"Cat Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}",
-                        message="A cat has been detected outside your door!\n\n" + gemini_response,
+                        message="A cat has been detected outside your door!\n\n" + gemini_response + (f"\nWeather: {temp} °F, {weather}" if temp and weather else ""),
                         phone_recipients=PHONE_RECIPIENTS,
                         email_recipients=EMAIL_RECIPIENTS
                     )
-                    upload_detection_to_firebase(timestamp, gemini_response, full_image_path)
+                    upload_detection_to_firebase(timestamp, gemini_response, full_image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                     cooldown_end_time = current_time + COOLDOWN_DURATION
 
         elapsed_time = time.time() - start_loop
