@@ -158,8 +158,7 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
             'detectionWeather': detectionWeather,
             'detectionIcon': detectionIcon
         }
-        # Construct the URL to your Supabase table. Here we assume a table named 'detections'
-        url = f"{SUPABASE_URL}/detections"
+        url = f"{SUPABASE_URL}/detections?apikey={SUPABASE_ANON_KEY}"
         headers = {
             "apikey": SUPABASE_ANON_KEY,
             "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
@@ -170,6 +169,7 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
         logging.info("Detection uploaded to Supabase.")
     except Exception as e:
         logging.error(f"Error uploading to Supabase: {e}")
+
 
 def check_email(cap):
     if not ENABLE_EMAIL_CHECK:
