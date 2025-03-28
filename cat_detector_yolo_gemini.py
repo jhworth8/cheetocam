@@ -15,6 +15,7 @@ import logging
 import PIL.Image
 import google.generativeai as genai
 from dotenv import load_dotenv
+from supabase import create_client, Client  # New import for Supabase
 
 # Load environment variables
 load_dotenv()
@@ -63,9 +64,10 @@ IMAP_PORT = 993
 if ENABLE_GEMINI:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Initialize Supabase details
+# Initialize Supabase client (using supabase-py)
 SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://hartonomy.com/rest/v1')
 SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
+supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # Initialize YOLO for cat detection
 if ENABLE_CAT_DETECTION:
@@ -158,18 +160,10 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
             'detectionWeather': detectionWeather,
             'detectionIcon': detectionIcon
         }
-        url = f"{SUPABASE_URL}/detections?apikey={SUPABASE_ANON_KEY}"
-        headers = {
-            "apikey": SUPABASE_ANON_KEY,
-            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-            "Content-Type": "application/json"
-        }
-        response = requests.post(url, json=detection_data, headers=headers, timeout=10)
-        response.raise_for_status()
-        logging.info("Detection uploaded to Supabase.")
+        response = supabase_client.table("detections").insert(detection_data).execute()
+        logging.info("Detection uploaded to Supabase with response: %s", response)
     except Exception as e:
         logging.error(f"Error uploading to Supabase: {e}")
-
 
 def check_email(cap):
     if not ENABLE_EMAIL_CHECK:
