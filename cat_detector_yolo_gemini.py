@@ -15,8 +15,6 @@ import logging
 import PIL.Image
 import google.generativeai as genai
 from dotenv import load_dotenv
-import firebase_admin
-from firebase_admin import credentials, db
 
 # Load environment variables
 load_dotenv()
@@ -31,7 +29,7 @@ logging.basicConfig(
     ]
 )
 
-logging.info("Starting cat detection system with Firebase integration...")
+logging.info("Starting cat detection system with Supabase integration...")
 
 # Email and API configuration
 SENDER_EMAIL = os.getenv('SENDER_EMAIL')
@@ -39,14 +37,14 @@ SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
 PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
 EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')  # New weather API key
+OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')  # Weather API key
 
 ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))
 ENABLE_EMAIL_RESPONSE = int(os.getenv('ENABLE_EMAIL_RESPONSE', '1'))
 ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_EMAIL_CHECK = int(os.getenv('ENABLE_EMAIL_CHECK', '1'))
 ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
-ENABLE_FIREBASE_UPLOAD = int(os.getenv('ENABLE_FIREBASE_UPLOAD', '1'))
+ENABLE_SUPABASE_UPLOAD = int(os.getenv('ENABLE_SUPABASE_UPLOAD', '1'))
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
@@ -65,17 +63,9 @@ IMAP_PORT = 993
 if ENABLE_GEMINI:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Initialize Firebase Admin SDK
-if ENABLE_FIREBASE_UPLOAD:
-    try:
-        cred = credentials.Certificate('serviceAccountKey.json')
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://cat-detector-77f57-default-rtdb.firebaseio.com/'
-        })
-        logging.info("Firebase initialized successfully.")
-    except Exception as e:
-        logging.error(f"Firebase initialization failed: {e}")
-        ENABLE_FIREBASE_UPLOAD = 0
+# Initialize Supabase details
+SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://hartonomy.com/rest/v1')
+SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
 
 # Initialize YOLO for cat detection
 if ENABLE_CAT_DETECTION:
@@ -151,8 +141,8 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
-def upload_detection_to_firebase(timestamp, gemini_response, main_image_path, detectionTemp=None, detectionWeather=None, detectionIcon=None):
-    if not ENABLE_FIREBASE_UPLOAD:
+def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, detectionTemp=None, detectionWeather=None, detectionIcon=None):
+    if not ENABLE_SUPABASE_UPLOAD:
         return
     try:
         with open(main_image_path, 'rb') as f:
@@ -168,11 +158,18 @@ def upload_detection_to_firebase(timestamp, gemini_response, main_image_path, de
             'detectionWeather': detectionWeather,
             'detectionIcon': detectionIcon
         }
-        ref = db.reference('detections')
-        new_ref = ref.push(detection_data)
-        logging.info(f"Detection uploaded to Firebase with key: {new_ref.key}")
+        # Construct the URL to your Supabase table. Here we assume a table named 'detections'
+        url = f"{SUPABASE_URL}/detections"
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json"
+        }
+        response = requests.post(url, json=detection_data, headers=headers, timeout=10)
+        response.raise_for_status()
+        logging.info("Detection uploaded to Supabase.")
     except Exception as e:
-        logging.error(f"Error uploading to Firebase: {e}")
+        logging.error(f"Error uploading to Supabase: {e}")
 
 def check_email(cap):
     if not ENABLE_EMAIL_CHECK:
@@ -223,8 +220,8 @@ def check_email(cap):
                             phone_recipients=[],
                             email_recipients=[sender]
                         )
-                        # Optionally upload this detection to Firebase with weather data
-                        upload_detection_to_firebase(timestamp, gemini_response, image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
+                        # Optionally upload this detection to Supabase with weather data
+                        upload_detection_to_supabase(timestamp, gemini_response, image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                 mail.store(email_id, '+FLAGS', '\\Seen')
         mail.logout()
     except Exception as e:
@@ -300,7 +297,7 @@ try:
                 temp, weather, icon = fetch_weather_data()
 
                 if gemini_response and "cat" in gemini_response.lower():
-                    logging.info("Gemini confirmed the presence of a cat. Uploading detection to Firebase...")
+                    logging.info("Gemini confirmed the presence of a cat. Uploading detection to Supabase...")
                     send_email_with_attachments(
                         image_paths=[full_image_path],
                         subject=f"Cat Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}",
@@ -308,7 +305,7 @@ try:
                         phone_recipients=PHONE_RECIPIENTS,
                         email_recipients=EMAIL_RECIPIENTS
                     )
-                    upload_detection_to_firebase(timestamp, gemini_response, full_image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
+                    upload_detection_to_supabase(timestamp, gemini_response, full_image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                     cooldown_end_time = current_time + COOLDOWN_DURATION
 
         elapsed_time = time.time() - start_loop
