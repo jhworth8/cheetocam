@@ -15,7 +15,7 @@ import logging
 import PIL.Image
 import google.generativeai as genai
 from dotenv import load_dotenv
-from supabase import create_client, Client  # New import for Supabase
+from supabase import create_client, Client  # Import for Supabase
 
 # Load environment variables
 load_dotenv()
@@ -151,14 +151,15 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
             image_data = f.read()
         image_base64 = base64.b64encode(image_data).decode('utf-8')
         epoch = time.time()
+        # Use lowercase keys to match your schema: detectiontemp, detectionweather, detectionicon
         detection_data = {
             'timestamp': timestamp,
             'epoch': epoch,
             'gemini_response': gemini_response,
             'main_image': image_base64,
-            'detectionTemp': detectionTemp,
-            'detectionWeather': detectionWeather,
-            'detectionIcon': detectionIcon
+            'detectiontemp': detectionTemp,
+            'detectionweather': detectionWeather,
+            'detectionicon': detectionIcon
         }
         response = supabase_client.table("detections").insert(detection_data).execute()
         logging.info("Detection uploaded to Supabase with response: %s", response)
@@ -214,7 +215,7 @@ def check_email(cap):
                             phone_recipients=[],
                             email_recipients=[sender]
                         )
-                        # Optionally upload this detection to Supabase with weather data
+                        # Upload this detection to Supabase with weather data
                         upload_detection_to_supabase(timestamp, gemini_response, image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                 mail.store(email_id, '+FLAGS', '\\Seen')
         mail.logout()
