@@ -65,7 +65,7 @@ if ENABLE_GEMINI:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize Supabase client (using supabase-py)
-SUPABASE_URL = os.getenv('SUPABASE_URL', 'https://hartonomy.com/rest/v1')
+SUPABASE_URL = os.getenv('SUPABASE_URL', '')
 SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
