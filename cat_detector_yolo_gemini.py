@@ -150,7 +150,7 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
         with open(main_image_path, 'rb') as f:
             image_data = f.read()
         image_base64 = base64.b64encode(image_data).decode('utf-8')
-        epoch = time.time()
+        epoch = int(time.time())
         # Use lowercase keys to match your schema: detectiontemp, detectionweather, detectionicon
         detection_data = {
             'timestamp': timestamp,
