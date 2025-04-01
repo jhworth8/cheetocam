@@ -30,7 +30,7 @@ logging.basicConfig(
     ]
 )
 
-logging.info("Starting cat detection system with Supabase integration...")
+logging.info("Starting cat detection system with Supabase and Pushover integration...")
 
 # Email and API configuration
 SENDER_EMAIL = os.getenv('SENDER_EMAIL')
@@ -39,6 +39,10 @@ PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split('
 EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')  # Weather API key
+
+# Pushover credentials - hardcoded as requested
+PUSHOVER_USER_KEY = "ubr5phjr9wymwabf8sg1anmsj9a12k"
+PUSHOVER_API_TOKEN = "aqgxkbzacmm4mi8fpu49duzwnorfjf"  # API token directly in code
 
 ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))
 ENABLE_EMAIL_RESPONSE = int(os.getenv('ENABLE_EMAIL_RESPONSE', '1'))
@@ -130,6 +134,39 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
         except Exception as e:
             logging.error(f"Failed to send to {recipient}: {e}")
 
+def send_pushover_notification(message, title="Cat Detection Alert", image_path=None):
+    """
+    Send a Pushover notification.
+    
+    Args:
+        message (str): The message content.
+        title (str): The notification title.
+        image_path (str, optional): Path to an image file to attach.
+    """
+    try:
+        files = {}
+        if image_path and os.path.exists(image_path):
+            files['attachment'] = open(image_path, 'rb')
+        response = requests.post(
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": PUSHOVER_API_TOKEN,
+                "user": PUSHOVER_USER_KEY,
+                "title": title,
+                "message": message,
+                "priority": 1  # High priority alert
+            },
+            files=files if files else None
+        )
+        if files:
+            files['attachment'].close()
+        if response.status_code == 200:
+            logging.info("Pushover notification sent successfully.")
+        else:
+            logging.error("Failed to send Pushover notification: %s", response.text)
+    except Exception as e:
+        logging.error("Error sending Pushover notification: %s", e)
+
 def get_gemini_response(image_path, prompt):
     if not ENABLE_GEMINI:
         return ""
@@ -215,6 +252,12 @@ def check_email(cap):
                             phone_recipients=[],
                             email_recipients=[sender]
                         )
+                        # Also send a Pushover notification for email-triggered detection
+                        send_pushover_notification(
+                            message=message,
+                            title="Email Triggered Cat Detection",
+                            image_path=image_path
+                        )
                         # Upload this detection to Supabase with weather data
                         upload_detection_to_supabase(timestamp, gemini_response, image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                 mail.store(email_id, '+FLAGS', '\\Seen')
@@ -292,14 +335,27 @@ try:
                 temp, weather, icon = fetch_weather_data()
 
                 if gemini_response and "cat" in gemini_response.lower():
-                    logging.info("Gemini confirmed the presence of a cat. Uploading detection to Supabase...")
+                    logging.info("Gemini confirmed the presence of a cat. Sending alerts and uploading detection...")
+                    subject = f"Cat Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                    message = "A cat has been detected outside your door!\n\n" + gemini_response
+                    if temp and weather:
+                        message += f"\nWeather: {temp} °F, {weather}"
+                    
+                    # Send email notification with attachments
                     send_email_with_attachments(
                         image_paths=[full_image_path],
-                        subject=f"Cat Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}",
-                        message="A cat has been detected outside your door!\n\n" + gemini_response + (f"\nWeather: {temp} °F, {weather}" if temp and weather else ""),
+                        subject=subject,
+                        message=message,
                         phone_recipients=PHONE_RECIPIENTS,
                         email_recipients=EMAIL_RECIPIENTS
                     )
+                    # Send Pushover notification with image attachment
+                    send_pushover_notification(
+                        message=message,
+                        title=subject,
+                        image_path=full_image_path
+                    )
+                    # Upload detection to Supabase
                     upload_detection_to_supabase(timestamp, gemini_response, full_image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                     cooldown_end_time = current_time + COOLDOWN_DURATION
 
