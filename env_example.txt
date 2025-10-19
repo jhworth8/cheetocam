@@ -1,0 +1,38 @@
+# Email Configuration
+SENDER_EMAIL=your_email@gmail.com
+SENDER_PASSWORD=your_app_password
+
+# Recipients (comma-separated)
+PHONE_RECIPIENTS=phone1@carrier.com,phone2@carrier.com
+EMAIL_RECIPIENTS=email1@gmail.com,email2@gmail.com
+
+# API Keys
+GEMINI_API_KEY=your_gemini_api_key
+OPENWEATHER_API_KEY=your_openweather_api_key
+
+# Supabase Configuration
+SUPABASE_URL=your_supabase_url
+SUPABASE_ANON_KEY=your_supabase_anon_key
+
+# Detection Settings
+ENABLE_GEMINI=1
+ENABLE_EMAIL_RESPONSE=1
+ENABLE_CAT_DETECTION=1
+ENABLE_EMAIL_CHECK=1
+ENABLE_ALERT_SENDING=1
+ENABLE_SUPABASE_UPLOAD=1
+ENABLE_MULTI_CLASS_DETECTION=1
+
+# Detection Configuration
+DETECTION_CONFIDENCE=0.5
+DETECTION_CLASSES=cat,dog,person,bird,car,truck,bicycle,motorbike,bus,train
+COOLDOWN_DURATION=30
+FRAME_DELAY=0.2
+EMAIL_CHECK_INTERVAL=5
+
+# Weather Configuration
+WEATHER_LAT=42.5467
+WEATHER_LON=-83.2113
+
+# Legacy YOLO Configuration (fallback)
+YOLO_DIR=yolo

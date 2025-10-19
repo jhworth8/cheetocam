@@ -1,0 +1,15 @@
+[Unit]
+Description=Cat Detection System with YOLOv11
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/cheetocam
+ExecStart=/usr/bin/python3 /home/pi/cheetocam/cat_detector_yolo_gemini_yolo11.py
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH=/home/pi/cheetocam
+
+[Install]
+WantedBy=multi-user.target
