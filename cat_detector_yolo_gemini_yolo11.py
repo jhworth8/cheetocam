@@ -270,7 +270,7 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
             'detectiontemp': detectionTemp,
             'detectionweather': detectionWeather,
             'detectionicon': detectionIcon,
-            'detected_classes': ','.join(detected_classes) if detected_classes else 'cat'
+            'detected_class': ','.join(detected_classes) if detected_classes else 'cat'
         }
         response = supabase_client.table("detections").insert(detection_data).execute()
         logging.info("Detection uploaded to Supabase with response: %s", response)
@@ -439,12 +439,8 @@ try:
 
                 gemini_response = ""
                 if ENABLE_GEMINI:
-                    # Create a more specific prompt to reduce false positives
-                    detected_classes_str = ', '.join(detected_classes)
-                    prompt = (f"I detected these objects in this image: {detected_classes_str}. "
-                              "Please confirm what you actually see in this image. "
-                              "Be specific and only mention objects that are clearly visible. "
-                              "If you don't see the detected objects, say so clearly.")
+                    prompt = ("Please provide a clear and concise description of the scene captured. "
+                              "Use short sentences to describe what you see.")
                     gemini_response = get_gemini_response(full_image_path, prompt)
 
                 # Fetch weather data when a detection is captured
