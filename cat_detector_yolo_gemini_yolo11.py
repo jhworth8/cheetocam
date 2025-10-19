@@ -439,14 +439,18 @@ try:
 
                 gemini_response = ""
                 if ENABLE_GEMINI:
-                    prompt = ("Please provide a clear and concise description of the scene captured. "
-                              "Use short sentences to describe what you see.")
+                    # Create a more specific prompt to reduce false positives
+                    detected_classes_str = ', '.join(detected_classes)
+                    prompt = (f"I detected these objects in this image: {detected_classes_str}. "
+                              "Please confirm what you actually see in this image. "
+                              "Be specific and only mention objects that are clearly visible. "
+                              "If you don't see the detected objects, say so clearly.")
                     gemini_response = get_gemini_response(full_image_path, prompt)
 
                 # Fetch weather data when a detection is captured
                 temp, weather, icon = fetch_weather_data()
 
-                # Check if Gemini confirms the detection
+                # Check if Gemini confirms the detection (any detected class, not just cat)
                 if gemini_response and any(cls in gemini_response.lower() for cls in detected_classes):
                     logging.info("Gemini confirmed the detection. Sending alerts and uploading detection...")
                     
