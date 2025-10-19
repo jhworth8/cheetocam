@@ -1,16 +1,15 @@
 import cv2
 import os
 import smtplib
-import imaplib
-import email
 from email.message import EmailMessage
 import time
 from datetime import datetime
 from pytz import timezone
 import numpy as np
 import requests
-import base64
 import logging
+import random
+from typing import Dict, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -34,10 +33,9 @@ YOLO_DIR = os.getenv('YOLO_DIR', 'yolo')
 DETECTION_DURATION = float(os.getenv('DETECTION_DURATION', '3'))
 ALERT_DURATION = float(os.getenv('ALERT_DURATION', '120'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
-EMAIL_CHECK_INTERVAL = float(os.getenv('EMAIL_CHECK_INTERVAL', '5'))
-
-IMAP_SERVER = 'imap.gmail.com'
-IMAP_PORT = 993
+TIMEZONE = os.getenv('TIMEZONE', 'US/Eastern')
+WEATHER_LATITUDE = os.getenv('WEATHER_LATITUDE')
+WEATHER_LONGITUDE = os.getenv('WEATHER_LONGITUDE')
 
 weights_path = os.path.join(YOLO_DIR, 'yolov3-tiny.weights')
 config_path = os.path.join(YOLO_DIR, 'yolov3-tiny.cfg')
@@ -56,6 +54,208 @@ net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
 net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 layer_names = net.getLayerNames()
 output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
+
+WEATHER_CODE_MAP: Dict[int, str] = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Foggy",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Light rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Light snow",
+    73: "Moderate snow",
+    75: "Heavy snow",
+    77: "Snow grains",
+    80: "Light rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Light snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with light hail",
+    99: "Thunderstorm with heavy hail",
+}
+
+WEATHER_EMOJI_MAP: Dict[int, str] = {
+    0: "☀️",
+    1: "🌤️",
+    2: "⛅",
+    3: "☁️",
+    45: "🌫️",
+    48: "🌁",
+    51: "🌦️",
+    53: "🌦️",
+    55: "🌧️",
+    56: "🌧️",
+    57: "🌧️",
+    61: "🌧️",
+    63: "🌧️",
+    65: "🌧️",
+    66: "🌧️",
+    67: "🌧️",
+    71: "❄️",
+    73: "❄️",
+    75: "❄️",
+    77: "🌨️",
+    80: "🌧️",
+    81: "🌧️",
+    82: "🌩️",
+    85: "❄️",
+    86: "❄️",
+    95: "⛈️",
+    96: "⛈️",
+    99: "⛈️",
+}
+
+MOOD_BOOSTERS = [
+    "Fun Fact: Cats have fewer taste buds than dogs, but they're better at spotting the laser pointer!",
+    "Joke: Why don't cats play poker in the jungle? Too many cheetahs!",
+    "Trivia: A group of kittens is called a kindle—your daily vocabulary boost!",
+    "Inspiration: 'In ancient times cats were worshipped as gods; they have not forgotten this.' — Terry Pratchett",
+    "Playful Prompt: Take a dance break! Bonus points if your cat joins in.",
+    "Self-Care Spark: Sip some water and stretch—future you will say me-wow!",
+]
+
+
+def interpret_weather(code: int) -> str:
+    return WEATHER_CODE_MAP.get(code, "Mystery weather")
+
+
+def weather_emoji(code: int) -> str:
+    return WEATHER_EMOJI_MAP.get(code, "🌈")
+
+
+def fetch_weather_snapshot() -> Optional[Dict[str, str]]:
+    if not WEATHER_LATITUDE or not WEATHER_LONGITUDE:
+        logging.info("Weather coordinates not provided; skipping weather lookup.")
+        return None
+
+    params = {
+        "latitude": WEATHER_LATITUDE,
+        "longitude": WEATHER_LONGITUDE,
+        "current_weather": "true",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": TIMEZONE,
+    }
+
+    try:
+        response = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        current = payload.get("current_weather")
+        daily = payload.get("daily", {})
+        if not current:
+            logging.warning("Weather lookup succeeded but missing current weather data.")
+            return None
+
+        code = int(current.get("weathercode", -1))
+        description = interpret_weather(code)
+        emoji = weather_emoji(code)
+        temperature = current.get("temperature")
+        wind_speed = current.get("windspeed")
+        high = None
+        low = None
+
+        temps_max = daily.get("temperature_2m_max")
+        temps_min = daily.get("temperature_2m_min")
+        if isinstance(temps_max, list) and temps_max:
+            high = temps_max[0]
+        if isinstance(temps_min, list) and temps_min:
+            low = temps_min[0]
+
+        snapshot = {
+            "description": description,
+            "emoji": emoji,
+            "temperature": f"{temperature:.0f}°C" if isinstance(temperature, (int, float)) else "N/A",
+            "wind": f"{wind_speed:.0f} km/h" if isinstance(wind_speed, (int, float)) else "N/A",
+        }
+
+        if high is not None and low is not None:
+            snapshot["range"] = f"{low:.0f}°C → {high:.0f}°C"
+
+        return snapshot
+    except requests.RequestException as exc:
+        logging.error(f"Unable to fetch weather data: {exc}")
+    except ValueError as exc:
+        logging.error(f"Weather data parsing error: {exc}")
+
+    return None
+
+
+def choose_mood_booster() -> str:
+    booster = random.choice(MOOD_BOOSTERS)
+    logging.debug(f"Selected mood booster: {booster}")
+    return booster
+
+
+def themed_greeting(event_time: datetime) -> str:
+    hour = event_time.hour
+    if 5 <= hour < 12:
+        vibe = "Morning Marvel"
+    elif 12 <= hour < 17:
+        vibe = "Afternoon Adventure"
+    elif 17 <= hour < 21:
+        vibe = "Twilight Triumph"
+    else:
+        vibe = "Moonlit Magic"
+    return f"{vibe} Alert!"
+
+
+def current_event_time() -> datetime:
+    try:
+        tz = timezone(TIMEZONE)
+    except Exception:
+        logging.warning(f"Invalid timezone '{TIMEZONE}' provided. Falling back to UTC.")
+        tz = timezone('UTC')
+    return datetime.now(tz)
+
+
+def build_notification_content(event_time: datetime, weather: Optional[Dict[str, str]]) -> Dict[str, str]:
+    booster = choose_mood_booster()
+    friendly_timestamp = event_time.strftime("%A, %B %d • %I:%M %p %Z")
+    header = themed_greeting(event_time)
+
+    weather_lines = []
+    if weather:
+        weather_lines.append(f"Weather: {weather['emoji']}  {weather['description']} at {weather['temperature']}")
+        if "range" in weather:
+            weather_lines.append(f"Day Range: {weather['range']}")
+        weather_lines.append(f"Wind: {weather['wind']}")
+    else:
+        weather_lines.append("Weather: 🌈  Unable to load live weather—enjoy the mystery!")
+
+    narrative = [
+        "┏━━━━━━━━━━━━━━━━━━━━━━━┓",
+        "┃  🐾 Cat Cam Spotlight  ┃",
+        "┗━━━━━━━━━━━━━━━━━━━━━━━┛",
+        f"Timestamp: {friendly_timestamp}",
+        *weather_lines,
+        "",
+        "Sighting Summary:",
+        "Your door-side paparazzi caught a feline friend striking a pose!",
+        "",
+        f"Mood Booster: {booster}",
+        "",
+        "Pro Tip: Share this moment with the household scoreboard for bonus bragging rights!",
+    ]
+
+    subject_weather = weather['emoji'] if weather else '🐱'
+    subject = f"{subject_weather} {header} — Cat Detected!"
+
+    return {
+        "subject": subject,
+        "message": "\n".join(narrative),
+    }
 
 def send_email_with_attachments(image_paths, subject, message, phone_recipients, email_recipients):
     all_recipients = phone_recipients + email_recipients
@@ -88,52 +288,6 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
         except Exception as e:
             logging.error(f"Failed to send email (MMS) to {recipient}: {e}")
 
-def check_email(cap):
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-        mail.login(SENDER_EMAIL, SENDER_PASSWORD)
-        mail.select('inbox')
-
-        result, data = mail.search(None, '(UNSEEN)')
-        if result == 'OK':
-            email_ids = data[0].split()
-            for email_id in email_ids:
-                result, msg_data = mail.fetch(email_id, '(RFC822)')
-                if result != 'OK':
-                    logging.error(f"Failed to fetch email ID {email_id}")
-                    continue
-
-                msg = email.message_from_bytes(msg_data[0][1])
-                sender = email.utils.parseaddr(msg['From'])[1]
-                logging.info(f"New email detected from: {sender}")
-
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                image_path = f'email_triggered_{timestamp}.jpg'
-                ret, frame = cap.read()
-                if ret:
-                    cv2.imwrite(image_path, frame)
-                    logging.info(f"Captured image saved: {image_path}")
-                else:
-                    logging.error("Failed to capture image.")
-                    continue
-
-                eastern = timezone('US/Eastern')
-                subject = "Here is what's going on!"
-                message = 'Currently outside the door...'
-                send_email_with_attachments(
-                    image_paths=[image_path],
-                    subject=subject,
-                    message=message,
-                    phone_recipients=[],
-                    email_recipients=[sender]
-                )
-
-                mail.store(email_id, '+FLAGS', '\\Seen')
-
-        mail.logout()
-    except Exception as e:
-        logging.error(f"Error in checking email: {e}")
-
 cap = cv2.VideoCapture("/dev/video0")
 if not cap.isOpened():
     logging.error("Cannot open camera")
@@ -141,7 +295,6 @@ if not cap.isOpened():
 
 state = 'waiting'
 cat_detected_start_time = None
-last_email_check_time = 0
 
 try:
     while True:
@@ -152,9 +305,6 @@ try:
             break
 
         current_time = time.time()
-        if current_time - last_email_check_time >= EMAIL_CHECK_INTERVAL:
-            check_email(cap)
-            last_email_check_time = current_time
 
         height, width, channels = frame.shape
         blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
@@ -210,13 +360,14 @@ try:
                             image_paths.append(cropped_image_path)
                             logging.info(f"Cropped image saved: {cropped_image_path}")
 
-                        eastern = timezone('US/Eastern')
-                        subject = f"Cat Detected at {datetime.now(eastern).strftime('%I:%M %p ET')}!"
-                        message = 'A cat has been detected outside your door!'
+                        event_time = current_event_time()
+                        weather_snapshot = fetch_weather_snapshot()
+                        notification = build_notification_content(event_time, weather_snapshot)
+
                         send_email_with_attachments(
                             image_paths=image_paths,
-                            subject=subject,
-                            message=message,
+                            subject=notification['subject'],
+                            message=notification['message'],
                             phone_recipients=PHONE_RECIPIENTS,
                             email_recipients=EMAIL_RECIPIENTS
                         )
