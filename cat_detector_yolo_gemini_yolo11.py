@@ -54,8 +54,27 @@ ENABLE_SUPABASE_UPLOAD = int(os.getenv('ENABLE_SUPABASE_UPLOAD', '1'))
 
 # Detection configuration
 DETECTION_CONFIDENCE = float(os.getenv('DETECTION_CONFIDENCE', '0.5'))
-DETECTION_CLASSES = os.getenv('DETECTION_CLASSES', 'cat,dog,person,bird,car,truck,bicycle,motorbike,bus,train').split(',')
-ENABLE_MULTI_CLASS_DETECTION = int(os.getenv('ENABLE_MULTI_CLASS_DETECTION', '1'))
+
+# All 80 YOLOv11 classes for comprehensive detection
+ALL_YOLO_CLASSES = [
+    'person', 'bicycle', 'car', 'motorbike', 'aeroplane', 'bus', 'train', 'truck', 'boat',
+    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+    'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+    'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+    'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+    'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+    'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
+    'chair', 'sofa', 'pottedplant', 'bed', 'diningtable', 'toilet', 'tvmonitor', 'laptop',
+    'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+]
+
+# Animal classes for special notifications
+ANIMAL_CLASSES = ['cat', 'dog', 'bird', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe']
+
+# Use all classes for detection
+DETECTION_CLASSES = ALL_YOLO_CLASSES
+ENABLE_MULTI_CLASS_DETECTION = 1
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
@@ -431,13 +450,31 @@ try:
                 if gemini_response and any(cls in gemini_response.lower() for cls in detected_classes):
                     logging.info("Gemini confirmed the detection. Sending alerts and uploading detection...")
                     
-                    # Create subject based on detected classes
-                    if len(detected_classes) == 1:
-                        subject = f"{detected_classes[0].title()} Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
-                    else:
-                        subject = f"Multiple Objects Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                    # Check if any animals were detected
+                    detected_animals = [cls for cls in detected_classes if cls in ANIMAL_CLASSES]
                     
-                    message = f"Detection Alert!\n\nDetected: {', '.join(detected_classes)}\n\n" + gemini_response
+                    # Create subject based on detected classes
+                    if detected_animals:
+                        if len(detected_animals) == 1:
+                            subject = f"🐾 {detected_animals[0].title()} Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                        else:
+                            subject = f"🐾 Multiple Animals Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                    else:
+                        if len(detected_classes) == 1:
+                            subject = f"📷 {detected_classes[0].title()} Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                        else:
+                            subject = f"📷 Multiple Objects Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                    
+                    # Create message with animal emphasis
+                    if detected_animals:
+                        message = f"🐾 Animal Detection Alert! 🐾\n\nDetected Animals: {', '.join(detected_animals)}\n"
+                        if len(detected_classes) > len(detected_animals):
+                            other_objects = [cls for cls in detected_classes if cls not in detected_animals]
+                            message += f"Other Objects: {', '.join(other_objects)}\n"
+                    else:
+                        message = f"📷 Detection Alert!\n\nDetected: {', '.join(detected_classes)}\n"
+                    
+                    message += f"\n{gemini_response}"
                     if temp and weather:
                         message += f"\nWeather: {temp} °F, {weather}"
                     
