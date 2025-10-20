@@ -447,6 +447,8 @@ try:
                 temp, weather, icon = fetch_weather_data()
 
                 # Check if Gemini confirms the detection (any detected class, not just cat)
+                logging.info(f"Gemini response: {gemini_response}")
+                logging.info(f"Detected classes: {detected_classes}")
                 if gemini_response and any(cls in gemini_response.lower() for cls in detected_classes):
                     logging.info("Gemini confirmed the detection. Sending alerts and uploading detection...")
                     
@@ -493,6 +495,8 @@ try:
                     # Upload detection to Supabase
                     upload_detection_to_supabase(timestamp, gemini_response, full_image_path, detected_classes, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
                     cooldown_end_time = current_time + COOLDOWN_DURATION
+                else:
+                    logging.info("Gemini did not confirm the detection. No alerts sent.")
 
         elapsed_time = time.time() - start_loop
         if elapsed_time < FRAME_DELAY:
