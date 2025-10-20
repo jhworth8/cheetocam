@@ -270,8 +270,7 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
             'main_image': image_base64,
             'detectiontemp': detectionTemp,
             'detectionweather': detectionWeather,
-            'detectionicon': detectionIcon,
-            'detected_class': ','.join(detected_classes) if detected_classes else 'cat'
+            'detectionicon': detectionIcon
         }
         response = supabase_client.table("detections").insert(detection_data).execute()
         logging.info("Detection uploaded to Supabase with response: %s", response)
