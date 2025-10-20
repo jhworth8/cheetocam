@@ -69,11 +69,11 @@ ALL_YOLO_CLASSES = [
     'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
-# Animal classes for special notifications
+# Animal classes for detection and notifications
 ANIMAL_CLASSES = ['cat', 'dog', 'bird', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe']
 
-# Use all classes for detection
-DETECTION_CLASSES = ALL_YOLO_CLASSES
+# Use only animal classes for detection
+DETECTION_CLASSES = ANIMAL_CLASSES
 ENABLE_MULTI_CLASS_DETECTION = 1
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
@@ -450,29 +450,14 @@ try:
                 if gemini_response and any(cls in gemini_response.lower() for cls in detected_classes):
                     logging.info("Gemini confirmed the detection. Sending alerts and uploading detection...")
                     
-                    # Check if any animals were detected
-                    detected_animals = [cls for cls in detected_classes if cls in ANIMAL_CLASSES]
-                    
-                    # Create subject based on detected classes
-                    if detected_animals:
-                        if len(detected_animals) == 1:
-                            subject = f"🐾 {detected_animals[0].title()} Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
-                        else:
-                            subject = f"🐾 Multiple Animals Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                    # Create subject based on detected animals
+                    if len(detected_classes) == 1:
+                        subject = f"🐾 {detected_classes[0].title()} Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
                     else:
-                        if len(detected_classes) == 1:
-                            subject = f"📷 {detected_classes[0].title()} Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
-                        else:
-                            subject = f"📷 Multiple Objects Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                        subject = f"🐾 Multiple Animals Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
                     
-                    # Create message with animal emphasis
-                    if detected_animals:
-                        message = f"🐾 Animal Detection Alert! 🐾\n\nDetected Animals: {', '.join(detected_animals)}\n"
-                        if len(detected_classes) > len(detected_animals):
-                            other_objects = [cls for cls in detected_classes if cls not in detected_animals]
-                            message += f"Other Objects: {', '.join(other_objects)}\n"
-                    else:
-                        message = f"📷 Detection Alert!\n\nDetected: {', '.join(detected_classes)}\n"
+                    # Create message for animal detection
+                    message = f"🐾 Animal Detection Alert! 🐾\n\nDetected Animals: {', '.join(detected_classes)}\n"
                     
                     message += f"\n{gemini_response}"
                     if temp and weather:
