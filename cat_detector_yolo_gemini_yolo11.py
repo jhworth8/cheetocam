@@ -38,6 +38,7 @@ SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
 PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
 EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
+BOTHER_EMAIL = os.getenv('BOTHER_EMAIL', '').strip()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 
@@ -452,9 +453,9 @@ try:
                     
                     # Create subject based on detected animals
                     if len(detected_classes) == 1:
-                        subject = f"🐾 {detected_classes[0].title()} Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                        subject = f"🐾 {detected_classes[0].title()} Detected on {datetime.now(timezone('US/Eastern')).strftime('%B %d, %Y at %I:%M %p ET')}"
                     else:
-                        subject = f"🐾 Multiple Animals Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
+                        subject = f"🐾 Multiple Animals Detected on {datetime.now(timezone('US/Eastern')).strftime('%B %d, %Y at %I:%M %p ET')}"
                     
                     # Create message for animal detection
                     message = f"🐾 Animal Detection Alert! 🐾\n\nDetected Animals: {', '.join(detected_classes)}\n"
@@ -464,13 +465,26 @@ try:
                         message += f"\nWeather: {temp} °F, {weather}"
                     
                     # Send email notification with attachments
-                    send_email_with_attachments(
-                        image_paths=[full_image_path],
-                        subject=subject,
-                        message=message,
-                        phone_recipients=PHONE_RECIPIENTS,
-                        email_recipients=EMAIL_RECIPIENTS
-                    )
+                    # Determine recipients based on detected animals
+                    if 'cat' in detected_classes:
+                        # Cat detection - send to normal recipients
+                        send_email_with_attachments(
+                            image_paths=[full_image_path],
+                            subject=subject,
+                            message=message,
+                            phone_recipients=PHONE_RECIPIENTS,
+                            email_recipients=EMAIL_RECIPIENTS
+                        )
+                    else:
+                        # Non-cat animal detection - send to bother email
+                        if BOTHER_EMAIL:
+                            send_email_with_attachments(
+                                image_paths=[full_image_path],
+                                subject=subject,
+                                message=message,
+                                phone_recipients=[],
+                                email_recipients=[BOTHER_EMAIL]
+                            )
                     # Send Pushover notification with image attachment
                     send_pushover_notification(
                         message=message,
