@@ -54,7 +54,7 @@ ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
 ENABLE_SUPABASE_UPLOAD = int(os.getenv('ENABLE_SUPABASE_UPLOAD', '1'))
 
 # Detection configuration
-DETECTION_CONFIDENCE = float(os.getenv('DETECTION_CONFIDENCE', '0.5'))
+DETECTION_CONFIDENCE = float(os.getenv('DETECTION_CONFIDENCE', '0.7'))
 
 # All 80 YOLOv11 classes for comprehensive detection
 ALL_YOLO_CLASSES = [
@@ -449,7 +449,25 @@ try:
                 # Check if Gemini confirms the detection (any detected class, not just cat)
                 logging.info(f"Gemini response: {gemini_response}")
                 logging.info(f"Detected classes: {detected_classes}")
-                if gemini_response and any(cls in gemini_response.lower() for cls in detected_classes):
+                
+                # Ensure Gemini response actually mentions the detected animal
+                gemini_confirmed = False
+                gemini_lower = gemini_response.lower()
+                
+                # Check for negation phrases that would indicate Gemini doesn't see the animal
+                negation_phrases = ["don't see", "do not see", "no ", "cannot see", "can't see", "is not visible", "not visible"]
+                has_negation = any(phrase in gemini_lower for phrase in negation_phrases)
+                
+                if not has_negation:
+                    for cls in detected_classes:
+                        if cls.lower() in gemini_lower:
+                            gemini_confirmed = True
+                            logging.info(f"Gemini confirmed detection of {cls}")
+                            break
+                else:
+                    logging.info("Gemini response contains negation - detection not confirmed")
+                
+                if gemini_confirmed:
                     logging.info("Gemini confirmed the detection. Sending alerts and uploading detection...")
                     
                     # Create subject based on detected animals
