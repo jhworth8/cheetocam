@@ -5,6 +5,7 @@ import smtplib
 import imaplib
 import email
 from email.message import EmailMessage
+import re
 import time
 from datetime import datetime
 from pytz import timezone
@@ -334,7 +335,7 @@ try:
                 # Fetch weather data when a detection is captured
                 temp, weather, icon = fetch_weather_data()
 
-                if gemini_response and "cat" in gemini_response.lower():
+                if gemini_response and re.search(r'\bcat\b', gemini_response.lower()):
                     logging.info("Gemini confirmed the presence of a cat. Sending alerts and uploading detection...")
                     subject = f"Cat Detected at {datetime.now(timezone('US/Eastern')).strftime('%I:%M %p ET')}"
                     message = "A cat has been detected outside your door!\n\n" + gemini_response

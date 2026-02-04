@@ -5,6 +5,7 @@ import smtplib
 import imaplib
 import email
 from email.message import EmailMessage
+import re
 import time
 from datetime import datetime
 from pytz import timezone
@@ -455,12 +456,24 @@ try:
                 gemini_lower = gemini_response.lower()
                 
                 # Check for negation phrases that would indicate Gemini doesn't see the animal
-                negation_phrases = ["don't see", "do not see", "no ", "cannot see", "can't see", "is not visible", "not visible"]
-                has_negation = any(phrase in gemini_lower for phrase in negation_phrases)
+                # Check for negation phrases that would indicate Gemini doesn't see the animal
+                # Use regex to avoid partial matches (e.g. "snow" triggering "no ")
+                negation_patterns = [
+                    r"\bdon'?t see\b", 
+                    r"\bdo not see\b", 
+                    r"\bno\b", 
+                    r"\bcannot see\b", 
+                    r"\bcan'?t see\b", 
+                    r"\bis not visible\b", 
+                    r"\bnot visible\b"
+                ]
+                
+                has_negation = any(re.search(pattern, gemini_lower) for pattern in negation_patterns)
                 
                 if not has_negation:
                     for cls in detected_classes:
-                        if cls.lower() in gemini_lower:
+                        # Use regex to match whole words only (e.g. avoid "scattered" matching "cat")
+                        if re.search(r'\b' + re.escape(cls.lower()) + r'\b', gemini_lower):
                             gemini_confirmed = True
                             logging.info(f"Gemini confirmed detection of {cls}")
                             break
