@@ -81,38 +81,21 @@ ENABLE_MULTI_CLASS_DETECTION = 1
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '180'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 
-# Moondream (local VLM via Ollama) configuration. Keep-alive "-1" tells
-# Ollama to never unload the model. Trade-off: ~1.7 GB RAM is permanently
-# reserved (out of 8 GB), but every detection is fast (~5-10s instead of
-# 30-60s cold-load). The Pi has plenty of headroom and an always-loaded
-# model produces less *fan noise* than periodic cold-loads, since the CPU
-# only spikes during inference, not while a model sits in RAM.
-OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434')
-MOONDREAM_MODEL = os.getenv('MOONDREAM_MODEL', 'moondream')
-# Ollama keep_alive accepts an int (-1 = forever, 0 = unload now) OR a Go
-# duration string like "5m"/"24h". A plain "-1" *string* fails Ollama's
-# parser, so we send ints as JSON numbers and let duration strings pass
-# through unchanged.
-MOONDREAM_KEEP_ALIVE = os.getenv('MOONDREAM_KEEP_ALIVE', '-1')
-MOONDREAM_TIMEOUT = float(os.getenv('MOONDREAM_TIMEOUT', '90'))
-
-def _ollama_keep_alive():
-    try:
-        return int(MOONDREAM_KEEP_ALIVE)
-    except (TypeError, ValueError):
-        return MOONDREAM_KEEP_ALIVE
-# Extra grace period to wait for Moondream after the GIF burst finishes.
-# If still no result by then, we fall back to Gemini.
-MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '60'))
-ENABLE_MOONDREAM = int(os.getenv('ENABLE_MOONDREAM', '1'))
-# Pre-warm Moondream on detector startup so the first detection doesn't pay
-# the ~20-40s cold-load penalty. Set to 0 to skip.
-MOONDREAM_PREWARM = int(os.getenv('MOONDREAM_PREWARM', '1'))
-# Downscale the image before sending to Moondream. Vision encoders resize
-# internally anyway; passing a smaller image cuts JSON payload + encode time
-# without hurting description quality much. Full-resolution image is still
-# what we save/email/upload.
-MOONDREAM_INPUT_DIM = int(os.getenv('MOONDREAM_INPUT_DIM', '384'))
+# Florence-2 (local VLM via HuggingFace transformers) configuration.
+# Replaces the Moondream/Ollama stack — Florence-2 base is ~230M params,
+# loads in ~500 MB RAM, and produces a 1-2 sentence caption in ~15-20s
+# on Pi 5 (vs Moondream's 70-85s). Much faster, somewhat dumber, no
+# LLM-generated title — subject reverts to the generic "Cat at the door".
+FLORENCE_MODEL_ID = os.getenv('FLORENCE_MODEL_ID', 'microsoft/Florence-2-base')
+# Florence task prompt: "<CAPTION>" (short, ~5 words),
+# "<DETAILED_CAPTION>" (one sentence), "<MORE_DETAILED_CAPTION>" (verbose).
+FLORENCE_TASK = os.getenv('FLORENCE_TASK', '<DETAILED_CAPTION>')
+FLORENCE_MAX_NEW_TOKENS = int(os.getenv('FLORENCE_MAX_NEW_TOKENS', '128'))
+FLORENCE_NUM_BEAMS = int(os.getenv('FLORENCE_NUM_BEAMS', '1'))  # 1 = greedy (fastest)
+# Extra grace period to wait for Florence after the GIF burst finishes.
+# If it hasn't returned by then, fall back to Gemini.
+FLORENCE_GRACE_AFTER_GIF = float(os.getenv('FLORENCE_GRACE_AFTER_GIF', '30'))
+ENABLE_FLORENCE = int(os.getenv('ENABLE_FLORENCE', '1'))
 # Drain this many frames immediately after a YOLO hit before saving the
 # "detection frame", so USB auto-exposure has a moment to settle. Subsequent
 # GIF frames are 5s later so they're always settled.
@@ -387,68 +370,53 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
-_TINY_PREWARM_IMAGE_B64 = None
-def _tiny_prewarm_image():
-    """Generate (once) a tiny solid-color JPEG and return base64. Used to
-    exercise Moondream's *vision* path during prewarm so the mmproj weights
-    load eagerly — a text-only prewarm leaves them lazy-loaded and the
-    first real cat detection pays the cost."""
-    global _TINY_PREWARM_IMAGE_B64
-    if _TINY_PREWARM_IMAGE_B64 is None:
-        # Solid gray 64x64 JPEG. ~1 KB.
-        img = PIL.Image.new('RGB', (64, 64), color=(128, 128, 128))
-        from io import BytesIO
-        buf = BytesIO()
-        img.save(buf, format='JPEG')
-        _TINY_PREWARM_IMAGE_B64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-    return _TINY_PREWARM_IMAGE_B64
+# Florence-2 model + processor are loaded lazily on first use (or eagerly
+# via load_florence_blocking() at startup) and kept resident for the
+# lifetime of the process. Loading takes ~5-10s after model files are
+# cached locally; first ever load downloads ~500 MB from HuggingFace.
+_FLORENCE_MODEL = None
+_FLORENCE_PROCESSOR = None
 
-def _try_prewarm_once(timeout=180):
-    """Single pre-warm attempt. Returns True if Moondream answers a vision
-    request — exercises both the LLM and the vision encoder so the first
-    real detection isn't a partial cold-load."""
-    try:
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": MOONDREAM_MODEL,
-                "prompt": "What color is this?",
-                "images": [_tiny_prewarm_image()],
-                "stream": False,
-                "keep_alive": _ollama_keep_alive(),
-            },
-            timeout=timeout,
-        )
-        if resp.ok:
-            return True
-        logging.warning(
-            f"Moondream pre-warm returned HTTP {resp.status_code}: "
-            f"{_safe_log_snippet(resp.text)}"
-        )
-        return False
-    except Exception as e:
-        logging.warning(f"Moondream pre-warm attempt failed: {_safe_log_snippet(e, 200)}")
-        return False
-
-def block_until_moondream_ready(retry_seconds=30):
-    """Block the detector until Moondream is loaded and responsive. The user
-    explicitly does NOT want detections firing while Moondream is unavailable,
-    so we retry indefinitely (systemd will outlive this loop)."""
-    if not (ENABLE_MOONDREAM and MOONDREAM_PREWARM):
+def load_florence_blocking(retry_seconds=30):
+    """Load Florence-2 into memory. Blocks the main loop until it's ready
+    — user explicitly does NOT want detections firing without the local
+    VLM available. Retries indefinitely on transient failure (e.g. HF
+    download flakiness)."""
+    global _FLORENCE_MODEL, _FLORENCE_PROCESSOR
+    if not ENABLE_FLORENCE:
+        return
+    if _FLORENCE_MODEL is not None:
         return
     attempt = 0
     while True:
         attempt += 1
-        logging.info(f"Pre-warming Moondream (attempt {attempt})... can take 20-40s on cold start.")
-        t0 = time.time()
-        if _try_prewarm_once():
-            logging.info(f"Moondream ready ({time.time() - t0:.1f}s on this attempt).")
-            return
-        logging.warning(
-            f"Moondream not ready yet. Sleeping {retry_seconds}s before retrying. "
-            "No detections will fire until Moondream is loaded."
+        logging.info(
+            f"Loading Florence-2 ({FLORENCE_MODEL_ID}) (attempt {attempt}). "
+            "First run downloads ~500 MB."
         )
-        time.sleep(retry_seconds)
+        t0 = time.time()
+        try:
+            from transformers import AutoProcessor, AutoModelForCausalLM
+            import torch
+            proc = AutoProcessor.from_pretrained(
+                FLORENCE_MODEL_ID, trust_remote_code=True
+            )
+            mdl = AutoModelForCausalLM.from_pretrained(
+                FLORENCE_MODEL_ID, trust_remote_code=True
+            ).eval()
+            # Pi 5 CPU has no fp16 hardware — keep weights at fp32 for speed.
+            mdl = mdl.to('cpu')
+            _FLORENCE_PROCESSOR = proc
+            _FLORENCE_MODEL = mdl
+            logging.info(f"Florence-2 loaded in {time.time() - t0:.1f}s.")
+            return
+        except Exception as e:
+            logging.warning(
+                f"Florence-2 load failed: {_safe_log_snippet(e, 300)}. "
+                f"Sleeping {retry_seconds}s before retrying. "
+                "No detections will fire until Florence is loaded."
+            )
+            time.sleep(retry_seconds)
 
 def _safe_log_snippet(s, limit=300):
     """Truncate a string for logging so we never dump a base64 image or other
@@ -481,127 +449,82 @@ def _downscaled_jpeg_b64(image_path, max_dim):
     img.save(buf, format='JPEG', quality=85)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-def build_caption_prompt(detected_classes):
-    """Prompt asking the VLM for a short notification title AND a 1-2 sentence
-    description, in a parseable structured format."""
-    classes_str = ", ".join(detected_classes)
-    return (
-        f"An object detector saw a {classes_str} in this image. Look at the "
-        "image and write a short phone-notification caption for a pet camera.\n\n"
-        "Context: this camera belongs to a household whose orange tabby cat "
-        "is named Cheeto. If (and only if) the cat in the image is clearly "
-        "an orange/ginger tabby, refer to it as Cheeto by name. For any "
-        "other animal or any cat that isn't an orange tabby, do not use the "
-        "name — describe generically.\n\n"
-        "Respond in exactly this format with no extra commentary:\n"
-        "TITLE: A 3-6 word phrase like \"Cheeto at the door\", \"Black cat "
-        "in window\", or \"Two cats on the porch\". Specific and descriptive, "
-        "no emoji.\n"
-        "DESCRIPTION: One or two short sentences describing the animal "
-        "(color, markings) and what it's doing. Mention anything notable "
-        "(wet fur, other animals, posture)."
-    )
-
-def parse_caption_response(text):
-    """Pull (title, description) out of a TITLE:/DESCRIPTION: block.
-    Returns ('', '') if the response is empty or unparseable."""
-    if not text:
-        return "", ""
-    text = text.strip()
-    title = ""
-    description = text  # fallback: use the whole thing as description
-    m_title = re.search(r"TITLE\s*:\s*(.+)", text, re.IGNORECASE)
-    if m_title:
-        title = m_title.group(1).strip()
-        # Title is the first non-empty line after TITLE:
-        title = title.splitlines()[0].strip().strip('"').strip("'")
-    m_desc = re.search(r"DESCRIPTION\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
-    if m_desc:
-        description = m_desc.group(1).strip().strip('"').strip("'")
-    # Cap title to a reasonable phone-notification length.
-    if title and len(title) > 60:
-        title = title[:57].rstrip() + "..."
-    return title, description
-
-def get_moondream_caption(image_path, detected_classes):
-    """Call local Ollama (Moondream) for (title, description). Returns
-    ('', '') on failure."""
-    if not ENABLE_MOONDREAM:
-        return "", ""
+def get_florence_description(image_path, detected_classes):
+    """Run Florence-2 on the captured image. Returns the generated caption
+    string, or '' on failure. Florence-2 doesn't follow free-form prompts —
+    it takes a fixed task token (FLORENCE_TASK) and produces a caption."""
+    if not ENABLE_FLORENCE or _FLORENCE_MODEL is None or _FLORENCE_PROCESSOR is None:
+        return ""
     try:
-        image_b64 = _downscaled_jpeg_b64(image_path, MOONDREAM_INPUT_DIM)
-        prompt = build_caption_prompt(detected_classes)
-        resp = requests.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={
-                "model": MOONDREAM_MODEL,
-                "prompt": prompt,
-                "images": [image_b64],
-                "stream": False,
-                "keep_alive": _ollama_keep_alive(),
-            },
-            timeout=MOONDREAM_TIMEOUT,
+        import torch
+        image = PIL.Image.open(image_path).convert('RGB')
+        inputs = _FLORENCE_PROCESSOR(
+            text=FLORENCE_TASK, images=image, return_tensors="pt"
         )
-        if not resp.ok:
-            logging.error(
-                f"Moondream HTTP {resp.status_code}: {_safe_log_snippet(resp.text)}"
+        with torch.inference_mode():
+            generated_ids = _FLORENCE_MODEL.generate(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=FLORENCE_MAX_NEW_TOKENS,
+                num_beams=FLORENCE_NUM_BEAMS,
+                do_sample=False,
             )
-            return "", ""
-        raw = (resp.json().get("response") or "").strip()
-        if _looks_like_base64_blob(raw):
-            logging.warning(
-                f"Moondream returned what looks like a base64 blob "
-                f"({len(raw)} chars) — discarding."
-            )
-            return "", ""
-        title, description = parse_caption_response(raw)
-        if title or description:
-            logging.info(
-                f"Moondream raw: {_safe_log_snippet(raw)!r} -> "
-                f"title={title!r} description={_safe_log_snippet(description)!r}"
-            )
-        return title, description
+        raw = _FLORENCE_PROCESSOR.batch_decode(
+            generated_ids, skip_special_tokens=False
+        )[0]
+        parsed = _FLORENCE_PROCESSOR.post_process_generation(
+            raw, task=FLORENCE_TASK, image_size=(image.width, image.height)
+        )
+        # post_process_generation returns {TASK_TOKEN: "caption text..."}.
+        caption = (parsed.get(FLORENCE_TASK) or "").strip()
+        # Florence sometimes prefixes "The image shows..." — keep as-is, it's fine.
+        if caption:
+            logging.info(f"Florence-2 caption: {_safe_log_snippet(caption)!r}")
+        return caption
     except Exception as e:
-        logging.error(f"Moondream error: {_safe_log_snippet(e, 200)}")
-        return "", ""
+        logging.error(f"Florence-2 error: {_safe_log_snippet(e, 300)}")
+        return ""
 
 class _CaptionThread(threading.Thread):
-    """Background worker that fetches a (title, description) caption from
-    Moondream. Started right when YOLO fires so the LLM runs in parallel
-    with the 5-frame GIF burst; the main loop joins it after the burst."""
+    """Background worker that fetches a Florence-2 caption. Started right
+    when YOLO fires so the VLM runs in parallel with the 5-frame GIF burst;
+    the main loop joins it after the burst."""
     def __init__(self, image_path, detected_classes):
         super().__init__(daemon=True)
         self.image_path = image_path
         self.detected_classes = detected_classes
-        self.title = ""
         self.description = ""
         self.started_at = time.time()
         self.finished_at = None
 
     def run(self):
-        self.title, self.description = get_moondream_caption(
+        self.description = get_florence_description(
             self.image_path, self.detected_classes)
         self.finished_at = time.time()
         elapsed = self.finished_at - self.started_at
-        if self.title or self.description:
-            logging.info(f"Moondream completed in {elapsed:.1f}s.")
+        if self.description:
+            logging.info(f"Florence-2 completed in {elapsed:.1f}s.")
         else:
-            logging.info(f"Moondream call finished in {elapsed:.1f}s with no usable result.")
+            logging.info(f"Florence-2 call finished in {elapsed:.1f}s with no usable result.")
 
 def resolve_caption(thread, image_path, detected_classes):
-    """Wait for the Moondream thread (with a grace period after GIF capture),
-    then fall back to Gemini if Moondream returned nothing.
-    Returns (title, description, source)."""
-    thread.join(timeout=MOONDREAM_GRACE_AFTER_GIF)
-    if thread.title or thread.description:
-        return thread.title, thread.description, "moondream"
-    logging.info("Moondream didn't return in time — falling back to Gemini.")
-    gemini_text = get_gemini_response(image_path, build_caption_prompt(detected_classes))
+    """Wait for the Florence-2 thread (with a grace period after GIF capture),
+    then fall back to Gemini if Florence returned nothing.
+    Returns (description, source). Florence-2 doesn't generate a title — the
+    caller uses a generic subject."""
+    thread.join(timeout=FLORENCE_GRACE_AFTER_GIF)
+    if thread.description:
+        return thread.description, "florence"
+    logging.info("Florence-2 didn't return in time — falling back to Gemini.")
+    classes_str = ", ".join(detected_classes)
+    gemini_prompt = (
+        f"An object detector saw a {classes_str} in this image. "
+        "In one or two short sentences, describe the animal and what it's doing."
+    )
+    gemini_text = get_gemini_response(image_path, gemini_prompt)
     if gemini_text and gemini_text != "Could not generate description.":
-        title, description = parse_caption_response(gemini_text)
-        if title or description:
-            return title, description, "gemini"
-    return "", "", "none"
+        return gemini_text.strip(), "gemini"
+    return "", "none"
 
 def build_confirmation_prompt(detected_classes):
     """Structured prompt that returns a parseable VISIBLE/DESCRIPTION block."""
@@ -750,9 +673,9 @@ if not cap.isOpened():
 
 logging.info("Camera initialized.")
 
-# Block until Moondream is loaded — the detector should never alert without
+# Block until Florence-2 is loaded — the detector should never alert without
 # the local VLM ready, per explicit configuration.
-block_until_moondream_ready()
+load_florence_blocking()
 
 logging.info("Beginning main loop...")
 
@@ -808,24 +731,23 @@ try:
                     logging.error(f"GIF capture failed: {e}")
                     gif_path = None
 
-                # Wait for Moondream (with grace period); fall back to Gemini
+                # Wait for Florence-2 (with grace period); fall back to Gemini
                 # if it hasn't returned anything by then.
-                llm_title, description, caption_source = resolve_caption(
+                description, caption_source = resolve_caption(
                     caption_thread, full_image_path, detected_classes)
                 logging.info(
                     f"Caption source: {caption_source}; "
-                    f"title={llm_title!r} description={_safe_log_snippet(description)!r}"
+                    f"description={_safe_log_snippet(description)!r}"
                 )
 
                 # Fetch weather data
                 temp, weather, icon = fetch_weather_data()
 
-                # Subject: prefer the LLM's title; fall back to a generic one.
+                # Subject is generic — Florence-2 doesn't generate titles. The
+                # rich content goes in the body + GIF attachment.
                 eastern_now = datetime.now(timezone('US/Eastern'))
                 time_str = eastern_now.strftime('%-I:%M %p ET')
-                if llm_title:
-                    subject = f"{llm_title} 🐾"
-                elif len(detected_classes) == 1:
+                if len(detected_classes) == 1:
                     subject = f"{detected_classes[0].title()} at the door 🐾"
                 else:
                     subject = f"Spotted: {', '.join(detected_classes)} 🐾"
