@@ -103,7 +103,7 @@ def _ollama_keep_alive():
         return MOONDREAM_KEEP_ALIVE
 # Extra grace period to wait for Moondream after the GIF burst finishes.
 # If still no result by then, we fall back to Gemini.
-MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '20'))
+MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '60'))
 ENABLE_MOONDREAM = int(os.getenv('ENABLE_MOONDREAM', '1'))
 # Pre-warm Moondream on detector startup so the first detection doesn't pay
 # the ~20-40s cold-load penalty. Set to 0 to skip.
@@ -378,15 +378,33 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
-def _try_prewarm_once(timeout=120):
-    """Single pre-warm attempt. Returns True if Moondream is loaded and
-    responding, False otherwise."""
+_TINY_PREWARM_IMAGE_B64 = None
+def _tiny_prewarm_image():
+    """Generate (once) a tiny solid-color JPEG and return base64. Used to
+    exercise Moondream's *vision* path during prewarm so the mmproj weights
+    load eagerly — a text-only prewarm leaves them lazy-loaded and the
+    first real cat detection pays the cost."""
+    global _TINY_PREWARM_IMAGE_B64
+    if _TINY_PREWARM_IMAGE_B64 is None:
+        # Solid gray 64x64 JPEG. ~1 KB.
+        img = PIL.Image.new('RGB', (64, 64), color=(128, 128, 128))
+        from io import BytesIO
+        buf = BytesIO()
+        img.save(buf, format='JPEG')
+        _TINY_PREWARM_IMAGE_B64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    return _TINY_PREWARM_IMAGE_B64
+
+def _try_prewarm_once(timeout=180):
+    """Single pre-warm attempt. Returns True if Moondream answers a vision
+    request — exercises both the LLM and the vision encoder so the first
+    real detection isn't a partial cold-load."""
     try:
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
                 "model": MOONDREAM_MODEL,
-                "prompt": "hi",
+                "prompt": "What color is this?",
+                "images": [_tiny_prewarm_image()],
                 "stream": False,
                 "keep_alive": _ollama_keep_alive(),
             },
@@ -501,11 +519,18 @@ class _DescriptionThread(threading.Thread):
         self.detected_classes = detected_classes
         self.result = ""
         self.source = "none"
+        self.started_at = time.time()
+        self.finished_at = None
 
     def run(self):
         self.result = get_moondream_description(self.image_path, self.detected_classes)
+        self.finished_at = time.time()
+        elapsed = self.finished_at - self.started_at
         if self.result:
             self.source = "moondream"
+            logging.info(f"Moondream completed in {elapsed:.1f}s.")
+        else:
+            logging.info(f"Moondream call finished in {elapsed:.1f}s with no usable result.")
 
 def resolve_description(thread, image_path, detected_classes):
     """Wait for the Moondream thread (with a grace period after GIF capture),
