@@ -77,7 +77,7 @@ ANIMAL_CLASSES = ['cat', 'dog', 'bird', 'horse', 'sheep', 'cow', 'elephant', 'be
 DETECTION_CLASSES = ANIMAL_CLASSES
 ENABLE_MULTI_CLASS_DETECTION = 1
 
-COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
+COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '300'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 
 # Initialize Gemini API if enabled
@@ -222,7 +222,7 @@ def fetch_weather_data():
         logging.error(f"Error fetching weather data: {e}")
         return None, None, None
 
-def capture_burst_gif(cap, first_frame, gif_path, additional_frames=4, interval_s=0.4, gif_fps=3, max_dim=640):
+def capture_burst_gif(cap, first_frame, gif_path, additional_frames=4, interval_s=5.0, gif_fps=2, max_dim=640):
     """Capture extra fresh frames after a detection and write an animated GIF.
 
     Reads-and-discards buffered camera frames between captures so each saved
