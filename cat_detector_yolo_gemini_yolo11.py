@@ -222,6 +222,43 @@ def fetch_weather_data():
         logging.error(f"Error fetching weather data: {e}")
         return None, None, None
 
+def capture_burst_gif(cap, first_frame, gif_path, additional_frames=4, interval_s=0.4, gif_fps=3, max_dim=640):
+    """Capture extra fresh frames after a detection and write an animated GIF.
+
+    Reads-and-discards buffered camera frames between captures so each saved
+    frame reflects the current scene, not stale buffer contents.
+    """
+    frames = [first_frame]
+    for _ in range(additional_frames):
+        end_t = time.time() + interval_s
+        last = None
+        while time.time() < end_t:
+            ret, f = cap.read()
+            if ret:
+                last = f
+        if last is not None:
+            frames.append(last)
+
+    pil_frames = []
+    for f in frames:
+        rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+        img = PIL.Image.fromarray(rgb)
+        img.thumbnail((max_dim, max_dim))
+        pil_frames.append(img)
+
+    duration_ms = int(1000 / gif_fps)
+    pil_frames[0].save(
+        gif_path,
+        save_all=True,
+        append_images=pil_frames[1:],
+        duration=duration_ms,
+        loop=0,
+        optimize=True,
+    )
+    size_kb = os.path.getsize(gif_path) / 1024
+    logging.info(f"Captured {len(frames)}-frame GIF -> {gif_path} ({size_kb:.0f} KB)")
+    return gif_path
+
 def send_email_with_attachments(image_paths, subject, message, phone_recipients, email_recipients):
     if not get_notification_settings()['email_enabled']:
         logging.info("Email notifications disabled via settings — skipping.")
@@ -244,7 +281,9 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
                 img_data = img.read()
                 _, ext = os.path.splitext(image_path)
                 ext = ext.lower().replace('.', '')
-                if ext not in ['jpg', 'jpeg', 'png']:
+                if ext == 'jpg':
+                    ext = 'jpeg'
+                if ext not in ['jpeg', 'png', 'gif']:
                     ext = 'jpeg'
                 msg.add_attachment(img_data, maintype='image', subtype=ext, filename=os.path.basename(image_path))
         try:
@@ -255,8 +294,13 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
         except Exception as e:
             logging.error(f"Failed to send to {recipient}: {e}")
 
-def send_pushover_notification(message, title="Detection Alert", image_path=None):
-    """Send a Pushover notification."""
+def send_pushover_notification(message, title="Detection Alert", image_path=None, priority=0):
+    """Send a Pushover notification.
+
+    priority: -2 lowest .. 2 emergency. 0 = normal (respects quiet hours),
+    1 = high (bypasses quiet hours, highlighted). Default 0 — only escalate
+    for non-cat/unexpected detections.
+    """
     if not get_notification_settings()['pushover_enabled']:
         logging.info("Pushover notifications disabled via settings — skipping.")
         return
@@ -271,7 +315,7 @@ def send_pushover_notification(message, title="Detection Alert", image_path=None
                 "user": PUSHOVER_USER_KEY,
                 "title": title,
                 "message": message,
-                "priority": 1
+                "priority": priority,
             },
             files=files if files else None
         )
@@ -289,13 +333,64 @@ def get_gemini_response(image_path, prompt):
         return ""
     try:
         sample_file = PIL.Image.open(image_path)
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        model = genai.GenerativeModel(model_name="gemini-3.1-flash-lite")
         response = model.generate_content([prompt, sample_file])
         logging.info("Gemini response received.")
         return response.text
     except Exception as e:
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
+
+def build_confirmation_prompt(detected_classes):
+    """Structured prompt that returns a parseable VISIBLE/DESCRIPTION block."""
+    classes_str = ", ".join(detected_classes)
+    return (
+        "You are confirming whether an animal that an object detector saw is "
+        "actually visible in this image.\n\n"
+        f"The detector reported: {classes_str}.\n\n"
+        "Respond in exactly this format with no extra commentary:\n"
+        "VISIBLE: yes  (or: no)\n"
+        "DESCRIPTION: One or two short sentences. If yes, describe the animal "
+        "(color/markings), what it's doing (sitting, walking, eating, etc.), "
+        "and anything notable (wet fur, other animals nearby, posture, etc.). "
+        "If no, briefly say what the image actually shows."
+    )
+
+def parse_gemini_confirmation(response_text, detected_classes):
+    """Return (confirmed: bool, description: str).
+
+    Prefers the structured VISIBLE/DESCRIPTION block. Falls back to keyword
+    matching when Gemini returns free-form text.
+    """
+    if not response_text:
+        return False, ""
+    text = response_text.strip()
+    description = text
+
+    visible_match = re.search(r"VISIBLE\s*:\s*(yes|no)\b", text, re.IGNORECASE)
+    desc_match = re.search(r"DESCRIPTION\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+    if desc_match:
+        description = desc_match.group(1).strip()
+
+    if visible_match:
+        return visible_match.group(1).lower() == "yes", description
+
+    # Fallback: free-form text — use the previous keyword/negation heuristic.
+    lowered = text.lower()
+    negation_patterns = [
+        r"\bdon'?t see\b",
+        r"\bdo not see\b",
+        r"\bcannot see\b",
+        r"\bcan'?t see\b",
+        r"\bis not visible\b",
+        r"\bnot visible\b",
+    ]
+    if any(re.search(p, lowered) for p in negation_patterns):
+        return False, description
+    for cls in detected_classes:
+        if re.search(r'\b' + re.escape(cls.lower()) + r'\b', lowered):
+            return True, description
+    return False, description
 
 def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, detected_classes=None, detectionTemp=None, detectionWeather=None, detectionIcon=None):
     if not ENABLE_SUPABASE_UPLOAD:
@@ -412,102 +507,119 @@ try:
             if detections:
                 detected_classes = [d['class'] for d in detections]
                 logging.info(f"Detected {len(detections)} objects: {detected_classes}")
-                
+
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 full_image_path = f'detection_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
 
                 gemini_response = ""
+                gemini_confirmed = False
+                description = ""
                 if ENABLE_GEMINI:
-                    prompt = ("Please provide a clear and concise description of the scene captured. "
-                              "Use short sentences to describe what you see.")
+                    prompt = build_confirmation_prompt(detected_classes)
                     gemini_response = get_gemini_response(full_image_path, prompt)
+                    gemini_confirmed, description = parse_gemini_confirmation(gemini_response, detected_classes)
+                    logging.info(f"Gemini raw: {gemini_response}")
+                    logging.info(f"Gemini confirmed={gemini_confirmed}; description={description!r}")
+                else:
+                    # If Gemini is disabled, trust YOLO directly.
+                    gemini_confirmed = True
 
                 # Fetch weather data when a detection is captured
                 temp, weather, icon = fetch_weather_data()
 
-                # Check if Gemini confirms the detection (any detected class, not just cat)
-                logging.info(f"Gemini response: {gemini_response}")
-                logging.info(f"Detected classes: {detected_classes}")
-                
-                # Ensure Gemini response actually mentions the detected animal
-                gemini_confirmed = False
-                gemini_lower = gemini_response.lower()
-                
-                # Check for negation phrases that would indicate Gemini doesn't see the animal
-                # Check for negation phrases that would indicate Gemini doesn't see the animal
-                # Use regex to avoid partial matches (e.g. "snow" triggering "no ")
-                negation_patterns = [
-                    r"\bdon'?t see\b", 
-                    r"\bdo not see\b", 
-                    r"\bno\b", 
-                    r"\bcannot see\b", 
-                    r"\bcan'?t see\b", 
-                    r"\bis not visible\b", 
-                    r"\bnot visible\b"
-                ]
-                
-                has_negation = any(re.search(pattern, gemini_lower) for pattern in negation_patterns)
-                
-                if not has_negation:
-                    for cls in detected_classes:
-                        # Use regex to match whole words only (e.g. avoid "scattered" matching "cat")
-                        if re.search(r'\b' + re.escape(cls.lower()) + r'\b', gemini_lower):
-                            gemini_confirmed = True
-                            logging.info(f"Gemini confirmed detection of {cls}")
-                            break
-                else:
-                    logging.info("Gemini response contains negation - detection not confirmed")
-                
                 if gemini_confirmed:
-                    logging.info("Gemini confirmed the detection. Sending alerts and uploading detection...")
-                    
-                    # Create subject based on detected animals
-                    if len(detected_classes) == 1:
-                        subject = f"🐾 {detected_classes[0].title()} Detected on {datetime.now(timezone('US/Eastern')).strftime('%B %d, %Y at %I:%M %p ET')}"
+                    logging.info("Detection confirmed. Capturing burst GIF and sending alerts...")
+
+                    # Capture the burst GIF immediately so the action is fresh.
+                    gif_path = f'detection_{timestamp}.gif'
+                    try:
+                        capture_burst_gif(cap, frame, gif_path)
+                    except Exception as e:
+                        logging.error(f"GIF capture failed: {e}")
+                        gif_path = None
+
+                    # Shorter, friendlier subject. Time goes in the body.
+                    eastern_now = datetime.now(timezone('US/Eastern'))
+                    time_str = eastern_now.strftime('%-I:%M %p ET')
+                    if 'cat' in detected_classes:
+                        subject = "Cheeto's home 🐾"
+                    elif len(detected_classes) == 1:
+                        subject = f"{detected_classes[0].title()} spotted 🐾"
                     else:
-                        subject = f"🐾 Multiple Animals Detected on {datetime.now(timezone('US/Eastern')).strftime('%B %d, %Y at %I:%M %p ET')}"
-                    
-                    # Create message for animal detection
-                    message = f"🐾 Animal Detection Alert! 🐾\n\nDetected Animals: {', '.join(detected_classes)}\n"
-                    
-                    message += f"\n{gemini_response}"
+                        subject = f"Visitors: {', '.join(detected_classes)} 🐾"
+
+                    # Message body: time, optional description, weather.
+                    body_lines = [f"{time_str} · {', '.join(detected_classes)}"]
+                    if description:
+                        body_lines.append("")
+                        body_lines.append(description)
                     if temp and weather:
-                        message += f"\nWeather: {temp} °F, {weather}"
-                    
-                    # Send email notification with attachments
-                    # Determine recipients based on detected animals
+                        body_lines.append("")
+                        body_lines.append(f"Weather: {temp:.0f}°F, {weather}")
+                    message = "\n".join(body_lines)
+
+                    # Build attachment list — both still + GIF for email so the
+                    # MMS gateway still gets the still if it strips the GIF.
+                    attachments = [full_image_path]
+                    if gif_path and os.path.exists(gif_path):
+                        attachments.append(gif_path)
+                    # Pushover takes a single attachment — prefer the GIF.
+                    pushover_attachment = gif_path if (gif_path and os.path.exists(gif_path)) else full_image_path
+
                     settings = get_notification_settings()
                     if 'cat' in detected_classes:
-                        # Cat detection - send to normal recipients
+                        # Cat detection — normal priority, normal recipients.
                         send_email_with_attachments(
-                            image_paths=[full_image_path],
+                            image_paths=attachments,
                             subject=subject,
                             message=message,
                             phone_recipients=settings['phone_recipients'],
                             email_recipients=settings['email_recipients']
                         )
+                        push_priority = 0
                     else:
-                        # Non-cat animal detection - send to bother email
+                        # Non-cat — escalate priority + go to bother_email only.
                         if settings['bother_email']:
                             send_email_with_attachments(
-                                image_paths=[full_image_path],
+                                image_paths=attachments,
                                 subject=subject,
                                 message=message,
                                 phone_recipients=[],
                                 email_recipients=[settings['bother_email']]
                             )
-                    # Send Pushover notification with image attachment
+                        push_priority = 1
+
                     send_pushover_notification(
                         message=message,
                         title=subject,
-                        image_path=full_image_path
+                        image_path=pushover_attachment,
+                        priority=push_priority,
                     )
-                    # Upload detection to Supabase
-                    upload_detection_to_supabase(timestamp, gemini_response, full_image_path, detected_classes, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
+
+                    upload_detection_to_supabase(
+                        timestamp, gemini_response, full_image_path,
+                        detected_classes, detectionTemp=temp,
+                        detectionWeather=weather, detectionIcon=icon,
+                    )
+
+                    # Clean up local files so the Pi disk doesn't fill up.
+                    for p in (full_image_path, gif_path):
+                        if p and os.path.exists(p):
+                            try:
+                                os.remove(p)
+                            except OSError as e:
+                                logging.warning(f"Could not remove {p}: {e}")
+
                     cooldown_end_time = current_time + COOLDOWN_DURATION
                 else:
                     logging.info("Gemini did not confirm the detection. No alerts sent.")
+                    # Detection was a false positive — drop the local image too.
+                    if os.path.exists(full_image_path):
+                        try:
+                            os.remove(full_image_path)
+                        except OSError as e:
+                            logging.warning(f"Could not remove {full_image_path}: {e}")
 
         elapsed_time = time.time() - start_loop
         if elapsed_time < FRAME_DELAY:
