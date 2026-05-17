@@ -91,8 +91,11 @@ MOONDREAM_KEEP_ALIVE = os.getenv('MOONDREAM_KEEP_ALIVE', '5m')
 MOONDREAM_TIMEOUT = float(os.getenv('MOONDREAM_TIMEOUT', '60'))
 # Extra grace period to wait for Moondream after the GIF burst finishes.
 # If still no result by then, we fall back to Gemini.
-MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '10'))
+MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '20'))
 ENABLE_MOONDREAM = int(os.getenv('ENABLE_MOONDREAM', '1'))
+# Pre-warm Moondream on detector startup so the first detection doesn't pay
+# the ~20-40s cold-load penalty. Set to 0 to skip.
+MOONDREAM_PREWARM = int(os.getenv('MOONDREAM_PREWARM', '1'))
 
 # Initialize Gemini API if enabled
 if ENABLE_GEMINI:
@@ -363,6 +366,31 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
+def prewarm_moondream(timeout=120):
+    """Send a tiny no-op request so Ollama loads the model into RAM. The
+    first real detection then doesn't have to wait for the cold load."""
+    if not (ENABLE_MOONDREAM and MOONDREAM_PREWARM):
+        return
+    try:
+        logging.info("Pre-warming Moondream (this can take 20-40s on first start)...")
+        t0 = time.time()
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": MOONDREAM_MODEL,
+                "prompt": "hi",
+                "stream": False,
+                "keep_alive": MOONDREAM_KEEP_ALIVE,
+            },
+            timeout=timeout,
+        )
+        if resp.ok:
+            logging.info(f"Moondream pre-warmed in {time.time() - t0:.1f}s.")
+        else:
+            logging.warning(f"Moondream pre-warm returned HTTP {resp.status_code}.")
+    except Exception as e:
+        logging.warning(f"Moondream pre-warm failed (will load on first real detection): {e}")
+
 def _safe_log_snippet(s, limit=300):
     """Truncate a string for logging so we never dump a base64 image or other
     huge payload into journald."""
@@ -609,6 +637,8 @@ if not cap.isOpened():
     exit()
 
 logging.info("Camera initialized. Beginning main loop...")
+
+prewarm_moondream()
 
 cooldown_end_time = 0.0
 
