@@ -2,8 +2,6 @@
 import cv2
 import os
 import smtplib
-import imaplib
-import email
 from email.message import EmailMessage
 import re
 import time
@@ -37,9 +35,10 @@ logging.info("Starting enhanced cat detection system with YOLOv11, Supabase and 
 # Email and API configuration
 SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
-PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
-EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
-BOTHER_EMAIL = os.getenv('BOTHER_EMAIL', '').strip()
+# Env recipients are fallbacks used only when notification_settings has no entries
+ENV_PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
+ENV_EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
+ENV_BOTHER_EMAIL = os.getenv('BOTHER_EMAIL', '').strip()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 
@@ -48,11 +47,11 @@ PUSHOVER_USER_KEY = "ubr5phjr9wymwabf8sg1anmsj9a12k"
 PUSHOVER_API_TOKEN = "aqgxkbzacmm4mi8fpu49duzwnorfjf"
 
 ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))
-ENABLE_EMAIL_RESPONSE = int(os.getenv('ENABLE_EMAIL_RESPONSE', '1'))
 ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
-ENABLE_EMAIL_CHECK = int(os.getenv('ENABLE_EMAIL_CHECK', '1'))
-ENABLE_ALERT_SENDING = int(os.getenv('ENABLE_ALERT_SENDING', '1'))
 ENABLE_SUPABASE_UPLOAD = int(os.getenv('ENABLE_SUPABASE_UPLOAD', '1'))
+
+# How often to re-fetch notification_settings from Supabase
+SETTINGS_REFRESH_SECONDS = int(os.getenv('SETTINGS_REFRESH_SECONDS', '30'))
 
 # Detection configuration
 DETECTION_CONFIDENCE = float(os.getenv('DETECTION_CONFIDENCE', '0.7'))
@@ -80,10 +79,6 @@ ENABLE_MULTI_CLASS_DETECTION = 1
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '30'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
-EMAIL_CHECK_INTERVAL = int(os.getenv('EMAIL_CHECK_INTERVAL', '5'))
-
-IMAP_SERVER = 'imap.gmail.com'
-IMAP_PORT = 993
 
 # Initialize Gemini API if enabled
 if ENABLE_GEMINI:
@@ -93,6 +88,46 @@ if ENABLE_GEMINI:
 SUPABASE_URL = os.getenv('SUPABASE_URL', '')
 SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# Notification settings cache. Refreshed from Supabase every
+# SETTINGS_REFRESH_SECONDS so the dashboard can toggle channels remotely without
+# restarting the service.
+_settings_cache = {
+    'fetched_at': 0.0,
+    'value': {
+        'email_enabled': True,
+        'pushover_enabled': True,
+        'email_recipients': ENV_EMAIL_RECIPIENTS,
+        'phone_recipients': ENV_PHONE_RECIPIENTS,
+        'bother_email': ENV_BOTHER_EMAIL,
+    },
+}
+
+def get_notification_settings():
+    now = time.time()
+    if now - _settings_cache['fetched_at'] < SETTINGS_REFRESH_SECONDS:
+        return _settings_cache['value']
+    try:
+        resp = supabase_client.table('notification_settings').select('*').eq('id', 1).limit(1).execute()
+        rows = resp.data or []
+        if rows:
+            row = rows[0]
+            email_recipients = row.get('email_recipients') or []
+            phone_recipients = row.get('phone_recipients') or []
+            bother_email = (row.get('bother_email') or '').strip()
+            _settings_cache['value'] = {
+                'email_enabled': bool(row.get('email_enabled', True)),
+                'pushover_enabled': bool(row.get('pushover_enabled', True)),
+                # Fall back to env recipients if the table column is empty so the
+                # detector keeps working before the dashboard is populated.
+                'email_recipients': email_recipients if email_recipients else ENV_EMAIL_RECIPIENTS,
+                'phone_recipients': phone_recipients if phone_recipients else ENV_PHONE_RECIPIENTS,
+                'bother_email': bother_email if bother_email else ENV_BOTHER_EMAIL,
+            }
+    except Exception as e:
+        logging.error(f"Failed to fetch notification_settings, using last known values: {e}")
+    _settings_cache['fetched_at'] = now
+    return _settings_cache['value']
 
 # Initialize YOLOv11 model
 model = None
@@ -188,9 +223,13 @@ def fetch_weather_data():
         return None, None, None
 
 def send_email_with_attachments(image_paths, subject, message, phone_recipients, email_recipients):
-    if not ENABLE_ALERT_SENDING:
+    if not get_notification_settings()['email_enabled']:
+        logging.info("Email notifications disabled via settings — skipping.")
         return
     all_recipients = phone_recipients + email_recipients
+    if not all_recipients:
+        logging.info("No email/phone recipients configured — skipping email send.")
+        return
     for recipient in all_recipients:
         msg = EmailMessage()
         msg['From'] = SENDER_EMAIL
@@ -218,6 +257,9 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
 
 def send_pushover_notification(message, title="Detection Alert", image_path=None):
     """Send a Pushover notification."""
+    if not get_notification_settings()['pushover_enabled']:
+        logging.info("Pushover notifications disabled via settings — skipping.")
+        return
     try:
         files = {}
         if image_path and os.path.exists(image_path):
@@ -340,65 +382,6 @@ def detect_objects_yolov3(frame):
         logging.error(f"YOLOv3 detection error: {e}")
         return []
 
-def check_email(cap):
-    if not ENABLE_EMAIL_CHECK:
-        return
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-        mail.login(SENDER_EMAIL, SENDER_PASSWORD)
-        mail.select('inbox')
-        result, data = mail.search(None, '(UNSEEN)')
-        if result == 'OK':
-            email_ids = data[0].split()
-            for email_id in email_ids:
-                result, msg_data = mail.fetch(email_id, '(RFC822)')
-                if result != 'OK':
-                    continue
-                msg = email.message_from_bytes(msg_data[0][1])
-                sender = email.utils.parseaddr(msg['From'])[1]
-                logging.info(f"New email from: {sender}")
-                all_known_senders = PHONE_RECIPIENTS + EMAIL_RECIPIENTS
-                if sender not in all_known_senders:
-                    mail.store(email_id, '+FLAGS', '\\Seen')
-                    continue
-                if ENABLE_EMAIL_RESPONSE:
-                    ret, frame = cap.read()
-                    if ret:
-                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        image_path = f'email_triggered_{timestamp}.jpg'
-                        cv2.imwrite(image_path, frame)
-                        logging.info(f"Captured image: {image_path}")
-                        gemini_response = ""
-                        if ENABLE_GEMINI:
-                            prompt = ("This image was captured in response to your inquiry. "
-                                      "Please provide a clear and concise description of what you see. Use short sentences.")
-                            gemini_response = get_gemini_response(image_path, prompt)
-                        temp, weather, icon = fetch_weather_data()
-                        eastern = timezone('US/Eastern')
-                        subject = "Here's what's going on!"
-                        message = "Currently outside the door...\n"
-                        if gemini_response:
-                            message += f"\nGemini Response:\n{gemini_response}"
-                        if temp and weather:
-                            message += f"\nWeather: {temp} °F, {weather}"
-                        send_email_with_attachments(
-                            image_paths=[image_path],
-                            subject=subject,
-                            message=message,
-                            phone_recipients=[],
-                            email_recipients=[sender]
-                        )
-                        send_pushover_notification(
-                            message=message,
-                            title="Email Triggered Detection",
-                            image_path=image_path
-                        )
-                        upload_detection_to_supabase(timestamp, gemini_response, image_path, detectionTemp=temp, detectionWeather=weather, detectionIcon=icon)
-                mail.store(email_id, '+FLAGS', '\\Seen')
-        mail.logout()
-    except Exception as e:
-        logging.error(f"Email check error: {e}")
-
 # Initialize camera
 cap = cv2.VideoCapture("/dev/video0")
 if not cap.isOpened():
@@ -408,7 +391,6 @@ if not cap.isOpened():
 logging.info("Camera initialized. Beginning main loop...")
 
 cooldown_end_time = 0.0
-last_email_check_time = 0.0
 
 try:
     while True:
@@ -419,9 +401,6 @@ try:
             break
 
         current_time = time.time()
-        if (current_time - last_email_check_time >= EMAIL_CHECK_INTERVAL):
-            check_email(cap)
-            last_email_check_time = current_time
 
         if ENABLE_CAT_DETECTION and current_time >= cooldown_end_time:
             # Choose detection method based on available model
@@ -498,24 +477,25 @@ try:
                     
                     # Send email notification with attachments
                     # Determine recipients based on detected animals
+                    settings = get_notification_settings()
                     if 'cat' in detected_classes:
                         # Cat detection - send to normal recipients
                         send_email_with_attachments(
                             image_paths=[full_image_path],
                             subject=subject,
                             message=message,
-                            phone_recipients=PHONE_RECIPIENTS,
-                            email_recipients=EMAIL_RECIPIENTS
+                            phone_recipients=settings['phone_recipients'],
+                            email_recipients=settings['email_recipients']
                         )
                     else:
                         # Non-cat animal detection - send to bother email
-                        if BOTHER_EMAIL:
+                        if settings['bother_email']:
                             send_email_with_attachments(
                                 image_paths=[full_image_path],
                                 subject=subject,
                                 message=message,
                                 phone_recipients=[],
-                                email_recipients=[BOTHER_EMAIL]
+                                email_recipients=[settings['bother_email']]
                             )
                     # Send Pushover notification with image attachment
                     send_pushover_notification(
