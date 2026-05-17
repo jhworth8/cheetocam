@@ -364,6 +364,25 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
+def _safe_log_snippet(s, limit=300):
+    """Truncate a string for logging so we never dump a base64 image or other
+    huge payload into journald."""
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"...<{len(s) - limit} more chars>"
+
+def _looks_like_base64_blob(s):
+    """Heuristic: a 'description' that's almost entirely base64 chars and
+    long is almost certainly the model echoing the image back."""
+    if not s or len(s) < 200:
+        return False
+    sample = s[:500]
+    b64_chars = sum(1 for c in sample if c.isalnum() or c in '+/=')
+    return b64_chars / len(sample) > 0.95
+
 def get_moondream_description(image_path, detected_classes):
     """Call local Ollama (Moondream) for an image description. Returns '' on failure."""
     if not ENABLE_MOONDREAM:
@@ -390,13 +409,25 @@ def get_moondream_description(image_path, detected_classes):
             },
             timeout=MOONDREAM_TIMEOUT,
         )
-        resp.raise_for_status()
+        if not resp.ok:
+            # Log only the status + a short snippet of the response body so a
+            # large error payload can't flood the logs.
+            logging.error(
+                f"Moondream HTTP {resp.status_code}: {_safe_log_snippet(resp.text)}"
+            )
+            return ""
         text = (resp.json().get("response") or "").strip()
+        if _looks_like_base64_blob(text):
+            logging.warning(
+                f"Moondream returned what looks like a base64 blob "
+                f"({len(text)} chars) — discarding."
+            )
+            return ""
         if text:
-            logging.info(f"Moondream description: {text!r}")
+            logging.info(f"Moondream description: {_safe_log_snippet(text)!r}")
         return text
     except Exception as e:
-        logging.error(f"Moondream error: {e}")
+        logging.error(f"Moondream error: {_safe_log_snippet(e, 200)}")
         return ""
 
 class _DescriptionThread(threading.Thread):
