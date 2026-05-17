@@ -481,20 +481,50 @@ def _downscaled_jpeg_b64(image_path, max_dim):
     img.save(buf, format='JPEG', quality=85)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-def get_moondream_description(image_path, detected_classes):
-    """Call local Ollama (Moondream) for an image description. Returns '' on failure."""
+def build_caption_prompt(detected_classes):
+    """Prompt asking the VLM for a short notification title AND a 1-2 sentence
+    description, in a parseable structured format."""
+    classes_str = ", ".join(detected_classes)
+    return (
+        f"An object detector saw a {classes_str} in this image. Look at the "
+        "image and write a short phone-notification caption for a pet camera.\n\n"
+        "Respond in exactly this format with no extra commentary:\n"
+        "TITLE: A 3-6 word phrase like \"Orange tabby at the door\" or "
+        "\"Cat sitting in window\". Specific and descriptive, no emoji.\n"
+        "DESCRIPTION: One or two short sentences describing the animal "
+        "(color, markings) and what it's doing. Mention anything notable "
+        "(wet fur, other animals, posture)."
+    )
+
+def parse_caption_response(text):
+    """Pull (title, description) out of a TITLE:/DESCRIPTION: block.
+    Returns ('', '') if the response is empty or unparseable."""
+    if not text:
+        return "", ""
+    text = text.strip()
+    title = ""
+    description = text  # fallback: use the whole thing as description
+    m_title = re.search(r"TITLE\s*:\s*(.+)", text, re.IGNORECASE)
+    if m_title:
+        title = m_title.group(1).strip()
+        # Title is the first non-empty line after TITLE:
+        title = title.splitlines()[0].strip().strip('"').strip("'")
+    m_desc = re.search(r"DESCRIPTION\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
+    if m_desc:
+        description = m_desc.group(1).strip().strip('"').strip("'")
+    # Cap title to a reasonable phone-notification length.
+    if title and len(title) > 60:
+        title = title[:57].rstrip() + "..."
+    return title, description
+
+def get_moondream_caption(image_path, detected_classes):
+    """Call local Ollama (Moondream) for (title, description). Returns
+    ('', '') on failure."""
     if not ENABLE_MOONDREAM:
-        return ""
+        return "", ""
     try:
         image_b64 = _downscaled_jpeg_b64(image_path, MOONDREAM_INPUT_DIM)
-        classes_str = ", ".join(detected_classes)
-        prompt = (
-            f"An object detector saw a {classes_str} in this image. "
-            "Describe in one or two short sentences what the animal looks like "
-            "(color, markings) and what it's doing (sitting, walking, eating, etc.). "
-            "If you also see anything notable like other animals, weather, or unusual "
-            "posture, mention it briefly."
-        )
+        prompt = build_caption_prompt(detected_classes)
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
@@ -507,69 +537,65 @@ def get_moondream_description(image_path, detected_classes):
             timeout=MOONDREAM_TIMEOUT,
         )
         if not resp.ok:
-            # Log only the status + a short snippet of the response body so a
-            # large error payload can't flood the logs.
             logging.error(
                 f"Moondream HTTP {resp.status_code}: {_safe_log_snippet(resp.text)}"
             )
-            return ""
-        text = (resp.json().get("response") or "").strip()
-        if _looks_like_base64_blob(text):
+            return "", ""
+        raw = (resp.json().get("response") or "").strip()
+        if _looks_like_base64_blob(raw):
             logging.warning(
                 f"Moondream returned what looks like a base64 blob "
-                f"({len(text)} chars) — discarding."
+                f"({len(raw)} chars) — discarding."
             )
-            return ""
-        if text:
-            logging.info(f"Moondream description: {_safe_log_snippet(text)!r}")
-        return text
+            return "", ""
+        title, description = parse_caption_response(raw)
+        if title or description:
+            logging.info(
+                f"Moondream raw: {_safe_log_snippet(raw)!r} -> "
+                f"title={title!r} description={_safe_log_snippet(description)!r}"
+            )
+        return title, description
     except Exception as e:
         logging.error(f"Moondream error: {_safe_log_snippet(e, 200)}")
-        return ""
+        return "", ""
 
-class _DescriptionThread(threading.Thread):
-    """Background worker that fetches a Moondream description.
-
-    Started right when YOLO fires so the LLM runs in parallel with the
-    5-frame GIF burst; the main loop joins it after the burst completes.
-    """
+class _CaptionThread(threading.Thread):
+    """Background worker that fetches a (title, description) caption from
+    Moondream. Started right when YOLO fires so the LLM runs in parallel
+    with the 5-frame GIF burst; the main loop joins it after the burst."""
     def __init__(self, image_path, detected_classes):
         super().__init__(daemon=True)
         self.image_path = image_path
         self.detected_classes = detected_classes
-        self.result = ""
-        self.source = "none"
+        self.title = ""
+        self.description = ""
         self.started_at = time.time()
         self.finished_at = None
 
     def run(self):
-        self.result = get_moondream_description(self.image_path, self.detected_classes)
+        self.title, self.description = get_moondream_caption(
+            self.image_path, self.detected_classes)
         self.finished_at = time.time()
         elapsed = self.finished_at - self.started_at
-        if self.result:
-            self.source = "moondream"
+        if self.title or self.description:
             logging.info(f"Moondream completed in {elapsed:.1f}s.")
         else:
             logging.info(f"Moondream call finished in {elapsed:.1f}s with no usable result.")
 
-def resolve_description(thread, image_path, detected_classes):
+def resolve_caption(thread, image_path, detected_classes):
     """Wait for the Moondream thread (with a grace period after GIF capture),
     then fall back to Gemini if Moondream returned nothing.
-    Returns (description, source)."""
+    Returns (title, description, source)."""
     thread.join(timeout=MOONDREAM_GRACE_AFTER_GIF)
-    if thread.result:
-        return thread.result, "moondream"
+    if thread.title or thread.description:
+        return thread.title, thread.description, "moondream"
     logging.info("Moondream didn't return in time — falling back to Gemini.")
-    classes_str = ", ".join(detected_classes)
-    gemini_prompt = (
-        f"An object detector saw a {classes_str} in this image. "
-        "In one or two short sentences, describe the animal's appearance and "
-        "what they're doing."
-    )
-    gemini_text = get_gemini_response(image_path, gemini_prompt)
+    gemini_text = get_gemini_response(image_path, build_caption_prompt(detected_classes))
     if gemini_text and gemini_text != "Could not generate description.":
-        return gemini_text, "gemini"
-    return "", "none"
+        title, description = parse_caption_response(gemini_text)
+        if title or description:
+            return title, description, "gemini"
+    return "", "", "none"
 
 def build_confirmation_prompt(detected_classes):
     """Structured prompt that returns a parseable VISIBLE/DESCRIPTION block."""
@@ -761,11 +787,12 @@ try:
                 full_image_path = f'detection_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
 
-                # Kick off description generation in the background so it runs
-                # in parallel with the 20-second GIF burst. We trust YOLO and
-                # always alert; description is purely additive.
-                desc_thread = _DescriptionThread(full_image_path, detected_classes)
-                desc_thread.start()
+                # Kick off caption (title + description) generation in the
+                # background so the LLM runs in parallel with the 20-second
+                # GIF burst. We trust YOLO and always alert; the LLM output
+                # is purely additive.
+                caption_thread = _CaptionThread(full_image_path, detected_classes)
+                caption_thread.start()
 
                 # Capture the burst GIF (~20s of action).
                 gif_path = f'detection_{timestamp}.gif'
@@ -777,16 +804,22 @@ try:
 
                 # Wait for Moondream (with grace period); fall back to Gemini
                 # if it hasn't returned anything by then.
-                description, desc_source = resolve_description(desc_thread, full_image_path, detected_classes)
-                logging.info(f"Description source: {desc_source}; text={description!r}")
+                llm_title, description, caption_source = resolve_caption(
+                    caption_thread, full_image_path, detected_classes)
+                logging.info(
+                    f"Caption source: {caption_source}; "
+                    f"title={llm_title!r} description={_safe_log_snippet(description)!r}"
+                )
 
                 # Fetch weather data
                 temp, weather, icon = fetch_weather_data()
 
-                # Subject + body
+                # Subject: prefer the LLM's title; fall back to a generic one.
                 eastern_now = datetime.now(timezone('US/Eastern'))
                 time_str = eastern_now.strftime('%-I:%M %p ET')
-                if len(detected_classes) == 1:
+                if llm_title:
+                    subject = f"{llm_title} 🐾"
+                elif len(detected_classes) == 1:
                     subject = f"{detected_classes[0].title()} at the door 🐾"
                 else:
                     subject = f"Spotted: {', '.join(detected_classes)} 🐾"
