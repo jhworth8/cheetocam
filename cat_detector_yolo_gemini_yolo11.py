@@ -584,7 +584,10 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
             'detectionicon': detectionIcon
         }
         response = supabase_client.table("detections").insert(detection_data).execute()
-        logging.info("Detection uploaded to Supabase with response: %s", response)
+        # Don't log the full response — it echoes the inserted row including the
+        # base64 main_image column, which floods journald. Log just the row count.
+        inserted = len(getattr(response, 'data', None) or [])
+        logging.info(f"Detection uploaded to Supabase ({inserted} row inserted).")
     except Exception as e:
         logging.error(f"Error uploading to Supabase: {e}")
 
