@@ -108,6 +108,15 @@ ENABLE_MOONDREAM = int(os.getenv('ENABLE_MOONDREAM', '1'))
 # Pre-warm Moondream on detector startup so the first detection doesn't pay
 # the ~20-40s cold-load penalty. Set to 0 to skip.
 MOONDREAM_PREWARM = int(os.getenv('MOONDREAM_PREWARM', '1'))
+# Downscale the image before sending to Moondream. Vision encoders resize
+# internally anyway; passing a smaller image cuts JSON payload + encode time
+# without hurting description quality much. Full-resolution image is still
+# what we save/email/upload.
+MOONDREAM_INPUT_DIM = int(os.getenv('MOONDREAM_INPUT_DIM', '384'))
+# Drain this many frames immediately after a YOLO hit before saving the
+# "detection frame", so USB auto-exposure has a moment to settle. Subsequent
+# GIF frames are 5s later so they're always settled.
+POST_DETECTION_SETTLE_FRAMES = int(os.getenv('POST_DETECTION_SETTLE_FRAMES', '10'))
 
 # Initialize Gemini API if enabled
 if ENABLE_GEMINI:
@@ -460,13 +469,24 @@ def _looks_like_base64_blob(s):
     b64_chars = sum(1 for c in sample if c.isalnum() or c in '+/=')
     return b64_chars / len(sample) > 0.95
 
+def _downscaled_jpeg_b64(image_path, max_dim):
+    """Load an image and re-encode as a smaller JPEG, returned base64.
+    Used to send a lighter image to Moondream while keeping the original
+    file intact for email/Pushover/Supabase."""
+    img = PIL.Image.open(image_path).convert('RGB')
+    if max(img.size) > max_dim:
+        img.thumbnail((max_dim, max_dim))
+    from io import BytesIO
+    buf = BytesIO()
+    img.save(buf, format='JPEG', quality=85)
+    return base64.b64encode(buf.getvalue()).decode('utf-8')
+
 def get_moondream_description(image_path, detected_classes):
     """Call local Ollama (Moondream) for an image description. Returns '' on failure."""
     if not ENABLE_MOONDREAM:
         return ""
     try:
-        with open(image_path, 'rb') as f:
-            image_b64 = base64.b64encode(f.read()).decode('utf-8')
+        image_b64 = _downscaled_jpeg_b64(image_path, MOONDREAM_INPUT_DIM)
         classes_str = ", ".join(detected_classes)
         prompt = (
             f"An object detector saw a {classes_str} in this image. "
@@ -727,6 +747,16 @@ try:
                 detected_classes = [d['class'] for d in detections]
                 logging.info(f"Detected {len(detections)} objects: {detected_classes}")
 
+                # Drain a few frames so USB auto-exposure has a moment to settle.
+                # The "detection moment" frame is often dark because the camera
+                # was mid-adjustment when YOLO fired.
+                settled_frame = frame
+                for _ in range(POST_DETECTION_SETTLE_FRAMES):
+                    ret, f = cap.read()
+                    if ret:
+                        settled_frame = f
+                frame = settled_frame
+
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 full_image_path = f'detection_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
@@ -756,12 +786,10 @@ try:
                 # Subject + body
                 eastern_now = datetime.now(timezone('US/Eastern'))
                 time_str = eastern_now.strftime('%-I:%M %p ET')
-                if 'cat' in detected_classes:
-                    subject = "Cheeto's home 🐾"
-                elif len(detected_classes) == 1:
-                    subject = f"{detected_classes[0].title()} spotted 🐾"
+                if len(detected_classes) == 1:
+                    subject = f"{detected_classes[0].title()} at the door 🐾"
                 else:
-                    subject = f"Visitors: {', '.join(detected_classes)} 🐾"
+                    subject = f"Spotted: {', '.join(detected_classes)} 🐾"
 
                 body_lines = [f"{time_str} · {', '.join(detected_classes)}"]
                 if description:
