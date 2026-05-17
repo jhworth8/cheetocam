@@ -6,6 +6,7 @@ from email.message import EmailMessage
 import re
 import time
 import threading
+import warnings
 from datetime import datetime
 from pytz import timezone
 import numpy as np
@@ -17,6 +18,15 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from ultralytics import YOLO
+
+# Silence the noisy "num_beams=1 with early_stopping=True" warning that
+# Florence-2's generation config triggers on every call. We use greedy
+# decoding intentionally for speed; the warning is cosmetic.
+warnings.filterwarnings(
+    "ignore",
+    message=".*num_beams.*early_stopping.*",
+    category=UserWarning,
+)
 
 # Load environment variables
 load_dotenv()
@@ -122,6 +132,7 @@ _settings_cache = {
         'phone_recipients': ENV_PHONE_RECIPIENTS,
         'bother_email': ENV_BOTHER_EMAIL,
         'cooldown_seconds': COOLDOWN_DURATION,
+        'use_local_ai': True,
     },
 }
 
@@ -144,6 +155,9 @@ def get_notification_settings():
                 cooldown = COOLDOWN_DURATION
             # Clamp to a sane range so a bad dashboard value can't break things.
             cooldown = max(10, min(cooldown, 3600))
+            use_local_ai = row.get('use_local_ai')
+            if use_local_ai is None:
+                use_local_ai = True
             _settings_cache['value'] = {
                 'email_enabled': bool(row.get('email_enabled', True)),
                 'pushover_enabled': bool(row.get('pushover_enabled', True)),
@@ -153,6 +167,7 @@ def get_notification_settings():
                 'phone_recipients': phone_recipients if phone_recipients else ENV_PHONE_RECIPIENTS,
                 'bother_email': bother_email if bother_email else ENV_BOTHER_EMAIL,
                 'cooldown_seconds': cooldown,
+                'use_local_ai': bool(use_local_ai),
             }
     except Exception as e:
         logging.error(f"Failed to fetch notification_settings, using last known values: {e}")
@@ -449,14 +464,26 @@ def _downscaled_jpeg_b64(image_path, max_dim):
     img.save(buf, format='JPEG', quality=85)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
+_ANIMAL_VOCAB = [
+    'cat', 'cats', 'kitten', 'feline', 'tabby', 'kitty',
+    'dog', 'dogs', 'puppy', 'canine', 'hound', 'pup',
+    'bird', 'birds', 'sparrow', 'robin', 'crow', 'pigeon', 'hawk',
+    'horse', 'sheep', 'cow', 'bear', 'deer', 'rabbit', 'squirrel',
+    'animal', 'animals', 'pet', 'pets', 'creature', 'creatures',
+    'paw', 'paws', 'fur', 'whisker', 'whiskers', 'tail',
+]
+
 def looks_like_false_positive(description):
-    """Return True if the VLM description clearly says the scene is empty
-    / has no animal. Conservative: only catches obvious negations so we
-    don't accidentally suppress real detections where the model just
-    described the cat in unusual terms."""
+    """Return True if the VLM description suggests the YOLO detection was a
+    false positive. Two signals:
+    1. Explicit negation phrases (\"no animal\", \"empty doorway\").
+    2. Description focuses on a person / objects but mentions NO
+       animal-related vocabulary. This catches the common case where YOLO
+       hallucinates a cat from a person's shadow or a phone screen."""
     if not description:
         return False
     text = description.lower()
+
     negation_patterns = [
         r"\bno animal[s]?\b",
         r"\bno cat[s]?\b",
@@ -470,7 +497,20 @@ def looks_like_false_positive(description):
         r"\bnot visible\b",
         r"\bno (animal|cat|dog|pet|one)s? (is|are) (present|visible|in)\b",
     ]
-    return any(re.search(p, text) for p in negation_patterns)
+    if any(re.search(p, text) for p in negation_patterns):
+        return True
+
+    # Signal 2: description mentions a person (or is clearly about objects)
+    # but doesn't mention any animal vocab at all.
+    has_animal_word = any(re.search(r'\b' + w + r'\b', text) for w in _ANIMAL_VOCAB)
+    if not has_animal_word:
+        person_markers = re.search(
+            r'\b(person|man|woman|people|human|child|girl|boy)\b', text
+        )
+        if person_markers:
+            return True
+
+    return False
 
 def get_florence_description(image_path, detected_classes):
     """Run Florence-2 on the captured image. Returns the generated caption
@@ -530,15 +570,8 @@ class _CaptionThread(threading.Thread):
         else:
             logging.info(f"Florence-2 call finished in {elapsed:.1f}s with no usable result.")
 
-def resolve_caption(thread, image_path, detected_classes):
-    """Wait for the Florence-2 thread (with a grace period after GIF capture),
-    then fall back to Gemini if Florence returned nothing.
-    Returns (description, source). Florence-2 doesn't generate a title — the
-    caller uses a generic subject."""
-    thread.join(timeout=FLORENCE_GRACE_AFTER_GIF)
-    if thread.description:
-        return thread.description, "florence"
-    logging.info("Florence-2 didn't return in time — falling back to Gemini.")
+def _call_gemini_for_description(image_path, detected_classes):
+    """Helper: call Gemini for a 1-2 sentence description."""
     classes_str = ", ".join(detected_classes)
     gemini_prompt = (
         f"An object detector saw a {classes_str} in this image. "
@@ -546,8 +579,26 @@ def resolve_caption(thread, image_path, detected_classes):
     )
     gemini_text = get_gemini_response(image_path, gemini_prompt)
     if gemini_text and gemini_text != "Could not generate description.":
-        return gemini_text.strip(), "gemini"
-    return "", "none"
+        return gemini_text.strip()
+    return ""
+
+def resolve_caption(thread, image_path, detected_classes):
+    """Wait for the Florence-2 thread (with a grace period after GIF capture),
+    then fall back to Gemini if Florence returned nothing OR if the user has
+    disabled local AI via the dashboard. Returns (description, source).
+    Florence-2 doesn't generate a title — the caller uses a generic subject."""
+    # thread is None when local AI is disabled or load failed; go straight to Gemini.
+    if thread is None:
+        logging.info("Local AI disabled — using Gemini for description.")
+        text = _call_gemini_for_description(image_path, detected_classes)
+        return (text, "gemini") if text else ("", "none")
+
+    thread.join(timeout=FLORENCE_GRACE_AFTER_GIF)
+    if thread.description:
+        return thread.description, "florence"
+    logging.info("Florence-2 didn't return in time — falling back to Gemini.")
+    text = _call_gemini_for_description(image_path, detected_classes)
+    return (text, "gemini") if text else ("", "none")
 
 def build_confirmation_prompt(detected_classes):
     """Structured prompt that returns a parseable VISIBLE/DESCRIPTION block."""
@@ -739,12 +790,17 @@ try:
                 full_image_path = f'detection_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
 
-                # Kick off caption (title + description) generation in the
-                # background so the LLM runs in parallel with the 20-second
-                # GIF burst. We trust YOLO and always alert; the LLM output
-                # is purely additive.
-                caption_thread = _CaptionThread(full_image_path, detected_classes)
-                caption_thread.start()
+                # Kick off caption generation in parallel with the GIF burst
+                # — but only if the user has local AI enabled. Otherwise we'd
+                # waste 30+s of CPU on a Florence-2 inference we'd throw away
+                # in favor of Gemini.
+                early_settings = get_notification_settings()
+                use_local = early_settings.get('use_local_ai', True)
+                if use_local:
+                    caption_thread = _CaptionThread(full_image_path, detected_classes)
+                    caption_thread.start()
+                else:
+                    caption_thread = None
 
                 # Capture the burst GIF (~20s of action).
                 gif_path = f'detection_{timestamp}.gif'
