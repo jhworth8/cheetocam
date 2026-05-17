@@ -366,14 +366,10 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
-def prewarm_moondream(timeout=120):
-    """Send a tiny no-op request so Ollama loads the model into RAM. The
-    first real detection then doesn't have to wait for the cold load."""
-    if not (ENABLE_MOONDREAM and MOONDREAM_PREWARM):
-        return
+def _try_prewarm_once(timeout=120):
+    """Single pre-warm attempt. Returns True if Moondream is loaded and
+    responding, False otherwise."""
     try:
-        logging.info("Pre-warming Moondream (this can take 20-40s on first start)...")
-        t0 = time.time()
         resp = requests.post(
             f"{OLLAMA_URL}/api/generate",
             json={
@@ -385,11 +381,35 @@ def prewarm_moondream(timeout=120):
             timeout=timeout,
         )
         if resp.ok:
-            logging.info(f"Moondream pre-warmed in {time.time() - t0:.1f}s.")
-        else:
-            logging.warning(f"Moondream pre-warm returned HTTP {resp.status_code}.")
+            return True
+        logging.warning(
+            f"Moondream pre-warm returned HTTP {resp.status_code}: "
+            f"{_safe_log_snippet(resp.text)}"
+        )
+        return False
     except Exception as e:
-        logging.warning(f"Moondream pre-warm failed (will load on first real detection): {e}")
+        logging.warning(f"Moondream pre-warm attempt failed: {_safe_log_snippet(e, 200)}")
+        return False
+
+def block_until_moondream_ready(retry_seconds=30):
+    """Block the detector until Moondream is loaded and responsive. The user
+    explicitly does NOT want detections firing while Moondream is unavailable,
+    so we retry indefinitely (systemd will outlive this loop)."""
+    if not (ENABLE_MOONDREAM and MOONDREAM_PREWARM):
+        return
+    attempt = 0
+    while True:
+        attempt += 1
+        logging.info(f"Pre-warming Moondream (attempt {attempt})... can take 20-40s on cold start.")
+        t0 = time.time()
+        if _try_prewarm_once():
+            logging.info(f"Moondream ready ({time.time() - t0:.1f}s on this attempt).")
+            return
+        logging.warning(
+            f"Moondream not ready yet. Sleeping {retry_seconds}s before retrying. "
+            "No detections will fire until Moondream is loaded."
+        )
+        time.sleep(retry_seconds)
 
 def _safe_log_snippet(s, limit=300):
     """Truncate a string for logging so we never dump a base64 image or other
@@ -636,9 +656,13 @@ if not cap.isOpened():
     logging.error("Cannot open camera")
     exit()
 
-logging.info("Camera initialized. Beginning main loop...")
+logging.info("Camera initialized.")
 
-prewarm_moondream()
+# Block until Moondream is loaded — the detector should never alert without
+# the local VLM ready, per explicit configuration.
+block_until_moondream_ready()
+
+logging.info("Beginning main loop...")
 
 cooldown_end_time = 0.0
 
