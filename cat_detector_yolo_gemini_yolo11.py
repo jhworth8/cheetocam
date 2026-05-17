@@ -245,11 +245,12 @@ def fetch_weather_data():
         logging.error(f"Error fetching weather data: {e}")
         return None, None, None
 
-def capture_burst_gif(cap, first_frame, gif_path, additional_frames=4, interval_s=5.0, gif_fps=2, max_dim=640):
+def capture_burst_gif(cap, first_frame, gif_path, additional_frames=4, interval_s=5.0, gif_fps=2):
     """Capture extra fresh frames after a detection and write an animated GIF.
 
     Reads-and-discards buffered camera frames between captures so each saved
-    frame reflects the current scene, not stale buffer contents.
+    frame reflects the current scene, not stale buffer contents. Frames are
+    kept at the camera's native resolution (no resize, no crop).
     """
     frames = [first_frame]
     for _ in range(additional_frames):
@@ -265,9 +266,7 @@ def capture_burst_gif(cap, first_frame, gif_path, additional_frames=4, interval_
     pil_frames = []
     for f in frames:
         rgb = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
-        img = PIL.Image.fromarray(rgb)
-        img.thumbnail((max_dim, max_dim))
-        pil_frames.append(img)
+        pil_frames.append(PIL.Image.fromarray(rgb))
 
     duration_ms = int(1000 / gif_fps)
     pil_frames[0].save(
