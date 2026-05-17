@@ -5,6 +5,7 @@ import smtplib
 from email.message import EmailMessage
 import re
 import time
+import threading
 from datetime import datetime
 from pytz import timezone
 import numpy as np
@@ -77,8 +78,21 @@ ANIMAL_CLASSES = ['cat', 'dog', 'bird', 'horse', 'sheep', 'cow', 'elephant', 'be
 DETECTION_CLASSES = ANIMAL_CLASSES
 ENABLE_MULTI_CLASS_DETECTION = 1
 
-COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '300'))
+COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '180'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
+
+# Moondream (local VLM via Ollama) configuration. Keep-alive controls how long
+# the model stays resident in RAM after the last request — once it expires,
+# Ollama unloads to free ~1.7 GB. With a 3-min cooldown and 5-min keep-alive,
+# consecutive visits stay warm; quiet hours unload.
+OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434')
+MOONDREAM_MODEL = os.getenv('MOONDREAM_MODEL', 'moondream')
+MOONDREAM_KEEP_ALIVE = os.getenv('MOONDREAM_KEEP_ALIVE', '5m')
+MOONDREAM_TIMEOUT = float(os.getenv('MOONDREAM_TIMEOUT', '60'))
+# Extra grace period to wait for Moondream after the GIF burst finishes.
+# If still no result by then, we fall back to Gemini.
+MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '10'))
+ENABLE_MOONDREAM = int(os.getenv('ENABLE_MOONDREAM', '1'))
 
 # Initialize Gemini API if enabled
 if ENABLE_GEMINI:
@@ -100,6 +114,7 @@ _settings_cache = {
         'email_recipients': ENV_EMAIL_RECIPIENTS,
         'phone_recipients': ENV_PHONE_RECIPIENTS,
         'bother_email': ENV_BOTHER_EMAIL,
+        'cooldown_seconds': COOLDOWN_DURATION,
     },
 }
 
@@ -115,6 +130,13 @@ def get_notification_settings():
             email_recipients = row.get('email_recipients') or []
             phone_recipients = row.get('phone_recipients') or []
             bother_email = (row.get('bother_email') or '').strip()
+            cooldown = row.get('cooldown_seconds')
+            try:
+                cooldown = int(cooldown) if cooldown is not None else COOLDOWN_DURATION
+            except (TypeError, ValueError):
+                cooldown = COOLDOWN_DURATION
+            # Clamp to a sane range so a bad dashboard value can't break things.
+            cooldown = max(10, min(cooldown, 3600))
             _settings_cache['value'] = {
                 'email_enabled': bool(row.get('email_enabled', True)),
                 'pushover_enabled': bool(row.get('pushover_enabled', True)),
@@ -123,6 +145,7 @@ def get_notification_settings():
                 'email_recipients': email_recipients if email_recipients else ENV_EMAIL_RECIPIENTS,
                 'phone_recipients': phone_recipients if phone_recipients else ENV_PHONE_RECIPIENTS,
                 'bother_email': bother_email if bother_email else ENV_BOTHER_EMAIL,
+                'cooldown_seconds': cooldown,
             }
     except Exception as e:
         logging.error(f"Failed to fetch notification_settings, using last known values: {e}")
@@ -341,6 +364,78 @@ def get_gemini_response(image_path, prompt):
         logging.error(f"Gemini error: {e}")
         return "Could not generate description."
 
+def get_moondream_description(image_path, detected_classes):
+    """Call local Ollama (Moondream) for an image description. Returns '' on failure."""
+    if not ENABLE_MOONDREAM:
+        return ""
+    try:
+        with open(image_path, 'rb') as f:
+            image_b64 = base64.b64encode(f.read()).decode('utf-8')
+        classes_str = ", ".join(detected_classes)
+        prompt = (
+            f"An object detector saw a {classes_str} in this image. "
+            "Describe in one or two short sentences what the animal looks like "
+            "(color, markings) and what it's doing (sitting, walking, eating, etc.). "
+            "If you also see anything notable like other animals, weather, or unusual "
+            "posture, mention it briefly."
+        )
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={
+                "model": MOONDREAM_MODEL,
+                "prompt": prompt,
+                "images": [image_b64],
+                "stream": False,
+                "keep_alive": MOONDREAM_KEEP_ALIVE,
+            },
+            timeout=MOONDREAM_TIMEOUT,
+        )
+        resp.raise_for_status()
+        text = (resp.json().get("response") or "").strip()
+        if text:
+            logging.info(f"Moondream description: {text!r}")
+        return text
+    except Exception as e:
+        logging.error(f"Moondream error: {e}")
+        return ""
+
+class _DescriptionThread(threading.Thread):
+    """Background worker that fetches a Moondream description.
+
+    Started right when YOLO fires so the LLM runs in parallel with the
+    5-frame GIF burst; the main loop joins it after the burst completes.
+    """
+    def __init__(self, image_path, detected_classes):
+        super().__init__(daemon=True)
+        self.image_path = image_path
+        self.detected_classes = detected_classes
+        self.result = ""
+        self.source = "none"
+
+    def run(self):
+        self.result = get_moondream_description(self.image_path, self.detected_classes)
+        if self.result:
+            self.source = "moondream"
+
+def resolve_description(thread, image_path, detected_classes):
+    """Wait for the Moondream thread (with a grace period after GIF capture),
+    then fall back to Gemini if Moondream returned nothing.
+    Returns (description, source)."""
+    thread.join(timeout=MOONDREAM_GRACE_AFTER_GIF)
+    if thread.result:
+        return thread.result, "moondream"
+    logging.info("Moondream didn't return in time — falling back to Gemini.")
+    classes_str = ", ".join(detected_classes)
+    gemini_prompt = (
+        f"An object detector saw a {classes_str} in this image. "
+        "In one or two short sentences, describe the animal's appearance and "
+        "what they're doing."
+    )
+    gemini_text = get_gemini_response(image_path, gemini_prompt)
+    if gemini_text and gemini_text != "Could not generate description.":
+        return gemini_text, "gemini"
+    return "", "none"
+
 def build_confirmation_prompt(detected_classes):
     """Structured prompt that returns a parseable VISIBLE/DESCRIPTION block."""
     classes_str = ", ".join(detected_classes)
@@ -512,114 +607,96 @@ try:
                 full_image_path = f'detection_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
 
-                gemini_response = ""
-                gemini_confirmed = False
-                description = ""
-                if ENABLE_GEMINI:
-                    prompt = build_confirmation_prompt(detected_classes)
-                    gemini_response = get_gemini_response(full_image_path, prompt)
-                    gemini_confirmed, description = parse_gemini_confirmation(gemini_response, detected_classes)
-                    logging.info(f"Gemini raw: {gemini_response}")
-                    logging.info(f"Gemini confirmed={gemini_confirmed}; description={description!r}")
-                else:
-                    # If Gemini is disabled, trust YOLO directly.
-                    gemini_confirmed = True
+                # Kick off description generation in the background so it runs
+                # in parallel with the 20-second GIF burst. We trust YOLO and
+                # always alert; description is purely additive.
+                desc_thread = _DescriptionThread(full_image_path, detected_classes)
+                desc_thread.start()
 
-                # Fetch weather data when a detection is captured
+                # Capture the burst GIF (~20s of action).
+                gif_path = f'detection_{timestamp}.gif'
+                try:
+                    capture_burst_gif(cap, frame, gif_path)
+                except Exception as e:
+                    logging.error(f"GIF capture failed: {e}")
+                    gif_path = None
+
+                # Wait for Moondream (with grace period); fall back to Gemini
+                # if it hasn't returned anything by then.
+                description, desc_source = resolve_description(desc_thread, full_image_path, detected_classes)
+                logging.info(f"Description source: {desc_source}; text={description!r}")
+
+                # Fetch weather data
                 temp, weather, icon = fetch_weather_data()
 
-                if gemini_confirmed:
-                    logging.info("Detection confirmed. Capturing burst GIF and sending alerts...")
+                # Subject + body
+                eastern_now = datetime.now(timezone('US/Eastern'))
+                time_str = eastern_now.strftime('%-I:%M %p ET')
+                if 'cat' in detected_classes:
+                    subject = "Cheeto's home 🐾"
+                elif len(detected_classes) == 1:
+                    subject = f"{detected_classes[0].title()} spotted 🐾"
+                else:
+                    subject = f"Visitors: {', '.join(detected_classes)} 🐾"
 
-                    # Capture the burst GIF immediately so the action is fresh.
-                    gif_path = f'detection_{timestamp}.gif'
-                    try:
-                        capture_burst_gif(cap, frame, gif_path)
-                    except Exception as e:
-                        logging.error(f"GIF capture failed: {e}")
-                        gif_path = None
+                body_lines = [f"{time_str} · {', '.join(detected_classes)}"]
+                if description:
+                    body_lines.append("")
+                    body_lines.append(description)
+                if temp and weather:
+                    body_lines.append("")
+                    body_lines.append(f"Weather: {temp:.0f}°F, {weather}")
+                message = "\n".join(body_lines)
 
-                    # Shorter, friendlier subject. Time goes in the body.
-                    eastern_now = datetime.now(timezone('US/Eastern'))
-                    time_str = eastern_now.strftime('%-I:%M %p ET')
-                    if 'cat' in detected_classes:
-                        subject = "Cheeto's home 🐾"
-                    elif len(detected_classes) == 1:
-                        subject = f"{detected_classes[0].title()} spotted 🐾"
-                    else:
-                        subject = f"Visitors: {', '.join(detected_classes)} 🐾"
+                # Email gets both still + GIF; Pushover prefers the GIF.
+                attachments = [full_image_path]
+                if gif_path and os.path.exists(gif_path):
+                    attachments.append(gif_path)
+                pushover_attachment = gif_path if (gif_path and os.path.exists(gif_path)) else full_image_path
 
-                    # Message body: time, optional description, weather.
-                    body_lines = [f"{time_str} · {', '.join(detected_classes)}"]
-                    if description:
-                        body_lines.append("")
-                        body_lines.append(description)
-                    if temp and weather:
-                        body_lines.append("")
-                        body_lines.append(f"Weather: {temp:.0f}°F, {weather}")
-                    message = "\n".join(body_lines)
-
-                    # Build attachment list — both still + GIF for email so the
-                    # MMS gateway still gets the still if it strips the GIF.
-                    attachments = [full_image_path]
-                    if gif_path and os.path.exists(gif_path):
-                        attachments.append(gif_path)
-                    # Pushover takes a single attachment — prefer the GIF.
-                    pushover_attachment = gif_path if (gif_path and os.path.exists(gif_path)) else full_image_path
-
-                    settings = get_notification_settings()
-                    if 'cat' in detected_classes:
-                        # Cat detection — normal priority, normal recipients.
+                settings = get_notification_settings()
+                if 'cat' in detected_classes:
+                    send_email_with_attachments(
+                        image_paths=attachments,
+                        subject=subject,
+                        message=message,
+                        phone_recipients=settings['phone_recipients'],
+                        email_recipients=settings['email_recipients'],
+                    )
+                    push_priority = 0
+                else:
+                    if settings['bother_email']:
                         send_email_with_attachments(
                             image_paths=attachments,
                             subject=subject,
                             message=message,
-                            phone_recipients=settings['phone_recipients'],
-                            email_recipients=settings['email_recipients']
+                            phone_recipients=[],
+                            email_recipients=[settings['bother_email']],
                         )
-                        push_priority = 0
-                    else:
-                        # Non-cat — escalate priority + go to bother_email only.
-                        if settings['bother_email']:
-                            send_email_with_attachments(
-                                image_paths=attachments,
-                                subject=subject,
-                                message=message,
-                                phone_recipients=[],
-                                email_recipients=[settings['bother_email']]
-                            )
-                        push_priority = 1
+                    push_priority = 1
 
-                    send_pushover_notification(
-                        message=message,
-                        title=subject,
-                        image_path=pushover_attachment,
-                        priority=push_priority,
-                    )
+                send_pushover_notification(
+                    message=message,
+                    title=subject,
+                    image_path=pushover_attachment,
+                    priority=push_priority,
+                )
 
-                    upload_detection_to_supabase(
-                        timestamp, gemini_response, full_image_path,
-                        detected_classes, detectionTemp=temp,
-                        detectionWeather=weather, detectionIcon=icon,
-                    )
+                upload_detection_to_supabase(
+                    timestamp, description, full_image_path,
+                    detected_classes, detectionTemp=temp,
+                    detectionWeather=weather, detectionIcon=icon,
+                )
 
-                    # Clean up local files so the Pi disk doesn't fill up.
-                    for p in (full_image_path, gif_path):
-                        if p and os.path.exists(p):
-                            try:
-                                os.remove(p)
-                            except OSError as e:
-                                logging.warning(f"Could not remove {p}: {e}")
-
-                    cooldown_end_time = current_time + COOLDOWN_DURATION
-                else:
-                    logging.info("Gemini did not confirm the detection. No alerts sent.")
-                    # Detection was a false positive — drop the local image too.
-                    if os.path.exists(full_image_path):
+                # Clean up local files so the Pi disk doesn't fill up.
+                for p in (full_image_path, gif_path):
+                    if p and os.path.exists(p):
                         try:
-                            os.remove(full_image_path)
+                            os.remove(p)
                         except OSError as e:
-                            logging.warning(f"Could not remove {full_image_path}: {e}")
+                            logging.warning(f"Could not remove {p}: {e}")
+
+                cooldown_end_time = current_time + settings['cooldown_seconds']
 
         elapsed_time = time.time() - start_loop
         if elapsed_time < FRAME_DELAY:
