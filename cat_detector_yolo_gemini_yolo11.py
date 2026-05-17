@@ -449,6 +449,29 @@ def _downscaled_jpeg_b64(image_path, max_dim):
     img.save(buf, format='JPEG', quality=85)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
+def looks_like_false_positive(description):
+    """Return True if the VLM description clearly says the scene is empty
+    / has no animal. Conservative: only catches obvious negations so we
+    don't accidentally suppress real detections where the model just
+    described the cat in unusual terms."""
+    if not description:
+        return False
+    text = description.lower()
+    negation_patterns = [
+        r"\bno animal[s]?\b",
+        r"\bno cat[s]?\b",
+        r"\bno dog[s]?\b",
+        r"\bno pet[s]?\b",
+        r"\bno one\b",
+        r"\bis empty\b",
+        r"\bappears (to be )?empty\b",
+        r"\bempty (doorway|view|frame|scene|porch|room|area|space)\b",
+        r"\bnothing (is )?(present|visible|in (the |this )?(view|frame|image))\b",
+        r"\bnot visible\b",
+        r"\bno (animal|cat|dog|pet|one)s? (is|are) (present|visible|in)\b",
+    ]
+    return any(re.search(p, text) for p in negation_patterns)
+
 def get_florence_description(image_path, detected_classes):
     """Run Florence-2 on the captured image. Returns the generated caption
     string, or '' on failure. Florence-2 doesn't follow free-form prompts —
@@ -739,6 +762,29 @@ try:
                     f"Caption source: {caption_source}; "
                     f"description={_safe_log_snippet(description)!r}"
                 )
+
+                # Soft false-positive filter: if the AI clearly says the scene
+                # is empty / has no animal, trust it over YOLO and skip
+                # everything (notification + Supabase upload). Catches the
+                # common case where YOLO hallucinates a "dog" from shadows.
+                if looks_like_false_positive(description):
+                    logging.info(
+                        "Suppressing alert: AI says no animal present. "
+                        f"YOLO classes were {detected_classes}, "
+                        f"description: {_safe_log_snippet(description)!r}"
+                    )
+                    # Clean up local files for the dropped detection.
+                    for p in (full_image_path, gif_path):
+                        if p and os.path.exists(p):
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                    # Short cooldown so a flickering YOLO false-positive doesn't
+                    # spam Florence on every frame, but not the full cooldown
+                    # since this wasn't a real detection.
+                    cooldown_end_time = current_time + 30
+                    continue
 
                 # Fetch weather data
                 temp, weather, icon = fetch_weather_data()
