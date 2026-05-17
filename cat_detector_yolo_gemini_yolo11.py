@@ -89,8 +89,18 @@ FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 # only spikes during inference, not while a model sits in RAM.
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434')
 MOONDREAM_MODEL = os.getenv('MOONDREAM_MODEL', 'moondream')
+# Ollama keep_alive accepts an int (-1 = forever, 0 = unload now) OR a Go
+# duration string like "5m"/"24h". A plain "-1" *string* fails Ollama's
+# parser, so we send ints as JSON numbers and let duration strings pass
+# through unchanged.
 MOONDREAM_KEEP_ALIVE = os.getenv('MOONDREAM_KEEP_ALIVE', '-1')
 MOONDREAM_TIMEOUT = float(os.getenv('MOONDREAM_TIMEOUT', '90'))
+
+def _ollama_keep_alive():
+    try:
+        return int(MOONDREAM_KEEP_ALIVE)
+    except (TypeError, ValueError):
+        return MOONDREAM_KEEP_ALIVE
 # Extra grace period to wait for Moondream after the GIF burst finishes.
 # If still no result by then, we fall back to Gemini.
 MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '20'))
@@ -378,7 +388,7 @@ def _try_prewarm_once(timeout=120):
                 "model": MOONDREAM_MODEL,
                 "prompt": "hi",
                 "stream": False,
-                "keep_alive": MOONDREAM_KEEP_ALIVE,
+                "keep_alive": _ollama_keep_alive(),
             },
             timeout=timeout,
         )
@@ -454,7 +464,7 @@ def get_moondream_description(image_path, detected_classes):
                 "prompt": prompt,
                 "images": [image_b64],
                 "stream": False,
-                "keep_alive": MOONDREAM_KEEP_ALIVE,
+                "keep_alive": _ollama_keep_alive(),
             },
             timeout=MOONDREAM_TIMEOUT,
         )
