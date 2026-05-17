@@ -81,14 +81,16 @@ ENABLE_MULTI_CLASS_DETECTION = 1
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '180'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 
-# Moondream (local VLM via Ollama) configuration. Keep-alive controls how long
-# the model stays resident in RAM after the last request — once it expires,
-# Ollama unloads to free ~1.7 GB. With a 3-min cooldown and 5-min keep-alive,
-# consecutive visits stay warm; quiet hours unload.
+# Moondream (local VLM via Ollama) configuration. Keep-alive "-1" tells
+# Ollama to never unload the model. Trade-off: ~1.7 GB RAM is permanently
+# reserved (out of 8 GB), but every detection is fast (~5-10s instead of
+# 30-60s cold-load). The Pi has plenty of headroom and an always-loaded
+# model produces less *fan noise* than periodic cold-loads, since the CPU
+# only spikes during inference, not while a model sits in RAM.
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434')
 MOONDREAM_MODEL = os.getenv('MOONDREAM_MODEL', 'moondream')
-MOONDREAM_KEEP_ALIVE = os.getenv('MOONDREAM_KEEP_ALIVE', '5m')
-MOONDREAM_TIMEOUT = float(os.getenv('MOONDREAM_TIMEOUT', '60'))
+MOONDREAM_KEEP_ALIVE = os.getenv('MOONDREAM_KEEP_ALIVE', '-1')
+MOONDREAM_TIMEOUT = float(os.getenv('MOONDREAM_TIMEOUT', '90'))
 # Extra grace period to wait for Moondream after the GIF burst finishes.
 # If still no result by then, we fall back to Gemini.
 MOONDREAM_GRACE_AFTER_GIF = float(os.getenv('MOONDREAM_GRACE_AFTER_GIF', '20'))
