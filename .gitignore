@@ -1,4 +1,7 @@
 .env
 *.jpg
 *.log
+*.gif
 serviceAccountKey.json
+__pycache__/
+*.pyc

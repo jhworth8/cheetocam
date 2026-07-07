@@ -19,6 +19,14 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from ultralytics import YOLO
 
+from caption_logic import (
+    ANIMAL_CLASSES,
+    should_suppress,
+    resolve_reported_classes,
+    build_confirmation_prompt,
+    parse_gemini_confirmation,
+)
+
 # Silence the noisy "num_beams=1 with early_stopping=True" warning that
 # Florence-2's generation config triggers on every call. We use greedy
 # decoding intentionally for speed; the warning is cosmetic.
@@ -58,6 +66,11 @@ PUSHOVER_USER_KEY = "ubr5phjr9wymwabf8sg1anmsj9a12k"
 PUSHOVER_API_TOKEN = "aqgxkbzacmm4mi8fpu49duzwnorfjf"
 
 ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))
+# Gemini cloud fallback for captions is OFF by default — the system is
+# local-AI-only (Florence-2). When Florence is unavailable or times out we
+# simply proceed without a caption (label hedged to 'cat') rather than
+# reaching out to Gemini. Set ENABLE_GEMINI_FALLBACK=1 to re-enable.
+ENABLE_GEMINI_FALLBACK = int(os.getenv('ENABLE_GEMINI_FALLBACK', '0'))
 ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_SUPABASE_UPLOAD = int(os.getenv('ENABLE_SUPABASE_UPLOAD', '1'))
 
@@ -81,12 +94,19 @@ ALL_YOLO_CLASSES = [
     'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
 ]
 
-# Animal classes for detection and notifications
-ANIMAL_CLASSES = ['cat', 'dog', 'bird', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe']
-
-# Use only animal classes for detection
+# Animal classes for detection. Split into plausible vs lookalike classes in
+# caption_logic.py: cow/elephant/giraffe/etc are still DETECTED (the nano
+# model regularly mislabels the cat as one of them, and we don't want a
+# mislabeled cat to slip through), but they're never REPORTED verbatim — the
+# VLM caption decides what to call the animal.
 DETECTION_CLASSES = ANIMAL_CLASSES
 ENABLE_MULTI_CLASS_DETECTION = 1
+
+# Require a target class in this many CONSECUTIVE frames before treating it
+# as a real detection. Frames are ~FRAME_DELAY apart, so 2 adds ~0.2-0.4s of
+# latency and kills single-frame YOLO flickers — the main false-positive
+# source (shadows, the doormat pattern, headlights).
+CONFIRM_FRAMES = int(os.getenv('CONFIRM_FRAMES', '2'))
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '180'))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
@@ -464,54 +484,6 @@ def _downscaled_jpeg_b64(image_path, max_dim):
     img.save(buf, format='JPEG', quality=85)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-_ANIMAL_VOCAB = [
-    'cat', 'cats', 'kitten', 'feline', 'tabby', 'kitty',
-    'dog', 'dogs', 'puppy', 'canine', 'hound', 'pup',
-    'bird', 'birds', 'sparrow', 'robin', 'crow', 'pigeon', 'hawk',
-    'horse', 'sheep', 'cow', 'bear', 'deer', 'rabbit', 'squirrel',
-    'animal', 'animals', 'pet', 'pets', 'creature', 'creatures',
-    'paw', 'paws', 'fur', 'whisker', 'whiskers', 'tail',
-]
-
-def looks_like_false_positive(description):
-    """Return True if the VLM description suggests the YOLO detection was a
-    false positive. Two signals:
-    1. Explicit negation phrases (\"no animal\", \"empty doorway\").
-    2. Description focuses on a person / objects but mentions NO
-       animal-related vocabulary. This catches the common case where YOLO
-       hallucinates a cat from a person's shadow or a phone screen."""
-    if not description:
-        return False
-    text = description.lower()
-
-    negation_patterns = [
-        r"\bno animal[s]?\b",
-        r"\bno cat[s]?\b",
-        r"\bno dog[s]?\b",
-        r"\bno pet[s]?\b",
-        r"\bno one\b",
-        r"\bis empty\b",
-        r"\bappears (to be )?empty\b",
-        r"\bempty (doorway|view|frame|scene|porch|room|area|space)\b",
-        r"\bnothing (is )?(present|visible|in (the |this )?(view|frame|image))\b",
-        r"\bnot visible\b",
-        r"\bno (animal|cat|dog|pet|one)s? (is|are) (present|visible|in)\b",
-    ]
-    if any(re.search(p, text) for p in negation_patterns):
-        return True
-
-    # Signal 2: description mentions a person (or is clearly about objects)
-    # but doesn't mention any animal vocab at all.
-    has_animal_word = any(re.search(r'\b' + w + r'\b', text) for w in _ANIMAL_VOCAB)
-    if not has_animal_word:
-        person_markers = re.search(
-            r'\b(person|man|woman|people|human|child|girl|boy)\b', text
-        )
-        if person_markers:
-            return True
-
-    return False
-
 def get_florence_description(image_path, detected_classes):
     """Run Florence-2 on the captured image. Returns the generated caption
     string, or '' on failure. Florence-2 doesn't follow free-form prompts —
@@ -571,85 +543,41 @@ class _CaptionThread(threading.Thread):
             logging.info(f"Florence-2 call finished in {elapsed:.1f}s with no usable result.")
 
 def _call_gemini_for_description(image_path, detected_classes):
-    """Helper: call Gemini for a 1-2 sentence description."""
-    classes_str = ", ".join(detected_classes)
-    gemini_prompt = (
-        f"An object detector saw a {classes_str} in this image. "
-        "In one or two short sentences, describe the animal and what it's doing."
-    )
-    gemini_text = get_gemini_response(image_path, gemini_prompt)
-    if gemini_text and gemini_text != "Could not generate description.":
-        return gemini_text.strip()
-    return ""
+    """Ask Gemini to confirm an animal is present AND describe it, via the
+    structured VISIBLE/DESCRIPTION prompt. Returns (description, says_absent).
+    says_absent is True only when Gemini explicitly reports no animal — API
+    failures return ("", False) so an outage alone never suppresses an alert."""
+    resp = get_gemini_response(image_path, build_confirmation_prompt(detected_classes))
+    if not resp or resp == "Could not generate description.":
+        return "", False
+    confirmed, description = parse_gemini_confirmation(resp, detected_classes)
+    return description.strip(), (not confirmed)
 
 def resolve_caption(thread, image_path, detected_classes):
     """Wait for the Florence-2 thread (with a grace period after GIF capture),
     then fall back to Gemini if Florence returned nothing OR if the user has
-    disabled local AI via the dashboard. Returns (description, source).
+    disabled local AI via the dashboard. Returns (description, source,
+    vlm_says_absent). vlm_says_absent is True when Gemini's structured
+    confirmation explicitly said no animal is visible.
     Florence-2 doesn't generate a title — the caller uses a generic subject."""
-    # thread is None when local AI is disabled or load failed; go straight to Gemini.
+    # thread is None when local AI is disabled or Florence failed to load.
     if thread is None:
-        logging.info("Local AI disabled — using Gemini for description.")
-        text = _call_gemini_for_description(image_path, detected_classes)
-        return (text, "gemini") if text else ("", "none")
+        if ENABLE_GEMINI_FALLBACK:
+            logging.info("Local AI disabled — using Gemini for description.")
+            text, absent = _call_gemini_for_description(image_path, detected_classes)
+            return text, ("gemini" if text else "none"), absent
+        logging.info("Local AI disabled and Gemini fallback off — no caption; label will hedge to cat.")
+        return "", "none", False
 
     thread.join(timeout=FLORENCE_GRACE_AFTER_GIF)
     if thread.description:
-        return thread.description, "florence"
-    logging.info("Florence-2 didn't return in time — falling back to Gemini.")
-    text = _call_gemini_for_description(image_path, detected_classes)
-    return (text, "gemini") if text else ("", "none")
-
-def build_confirmation_prompt(detected_classes):
-    """Structured prompt that returns a parseable VISIBLE/DESCRIPTION block."""
-    classes_str = ", ".join(detected_classes)
-    return (
-        "You are confirming whether an animal that an object detector saw is "
-        "actually visible in this image.\n\n"
-        f"The detector reported: {classes_str}.\n\n"
-        "Respond in exactly this format with no extra commentary:\n"
-        "VISIBLE: yes  (or: no)\n"
-        "DESCRIPTION: One or two short sentences. If yes, describe the animal "
-        "(color/markings), what it's doing (sitting, walking, eating, etc.), "
-        "and anything notable (wet fur, other animals nearby, posture, etc.). "
-        "If no, briefly say what the image actually shows."
-    )
-
-def parse_gemini_confirmation(response_text, detected_classes):
-    """Return (confirmed: bool, description: str).
-
-    Prefers the structured VISIBLE/DESCRIPTION block. Falls back to keyword
-    matching when Gemini returns free-form text.
-    """
-    if not response_text:
-        return False, ""
-    text = response_text.strip()
-    description = text
-
-    visible_match = re.search(r"VISIBLE\s*:\s*(yes|no)\b", text, re.IGNORECASE)
-    desc_match = re.search(r"DESCRIPTION\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
-    if desc_match:
-        description = desc_match.group(1).strip()
-
-    if visible_match:
-        return visible_match.group(1).lower() == "yes", description
-
-    # Fallback: free-form text — use the previous keyword/negation heuristic.
-    lowered = text.lower()
-    negation_patterns = [
-        r"\bdon'?t see\b",
-        r"\bdo not see\b",
-        r"\bcannot see\b",
-        r"\bcan'?t see\b",
-        r"\bis not visible\b",
-        r"\bnot visible\b",
-    ]
-    if any(re.search(p, lowered) for p in negation_patterns):
-        return False, description
-    for cls in detected_classes:
-        if re.search(r'\b' + re.escape(cls.lower()) + r'\b', lowered):
-            return True, description
-    return False, description
+        return thread.description, "florence", False
+    if ENABLE_GEMINI_FALLBACK:
+        logging.info("Florence-2 didn't return in time — falling back to Gemini.")
+        text, absent = _call_gemini_for_description(image_path, detected_classes)
+        return text, ("gemini" if text else "none"), absent
+    logging.info("Florence-2 returned nothing and Gemini fallback off — no caption; label will hedge to cat.")
+    return "", "none", False
 
 def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, detected_classes=None, detectionTemp=None, detectionWeather=None, detectionIcon=None):
     if not ENABLE_SUPABASE_UPLOAD:
@@ -754,6 +682,7 @@ load_florence_blocking()
 logging.info("Beginning main loop...")
 
 cooldown_end_time = 0.0
+detection_streak = 0  # consecutive frames with a target class in view
 
 try:
     while True:
@@ -771,8 +700,19 @@ try:
                 detections = detect_objects_yolo11(frame)
             else:
                 detections = detect_objects_yolov3(frame)
-            
+
             if detections:
+                detection_streak += 1
+            else:
+                detection_streak = 0
+
+            if detections and detection_streak < CONFIRM_FRAMES:
+                logging.info(
+                    f"Possible {[d['class'] for d in detections]} — waiting for "
+                    f"{CONFIRM_FRAMES} consecutive frames ({detection_streak}/{CONFIRM_FRAMES})."
+                )
+            elif detections:
+                detection_streak = 0
                 detected_classes = [d['class'] for d in detections]
                 logging.info(f"Detected {len(detections)} objects: {detected_classes}")
 
@@ -812,18 +752,19 @@ try:
 
                 # Wait for Florence-2 (with grace period); fall back to Gemini
                 # if it hasn't returned anything by then.
-                description, caption_source = resolve_caption(
+                description, caption_source, vlm_says_absent = resolve_caption(
                     caption_thread, full_image_path, detected_classes)
                 logging.info(
                     f"Caption source: {caption_source}; "
                     f"description={_safe_log_snippet(description)!r}"
                 )
 
-                # Soft false-positive filter: if the AI clearly says the scene
-                # is empty / has no animal, trust it over YOLO and skip
-                # everything (notification + Supabase upload). Catches the
-                # common case where YOLO hallucinates a "dog" from shadows.
-                if looks_like_false_positive(description):
+                # False-positive filter: skip everything (notification +
+                # Supabase upload) when Gemini explicitly said no animal is
+                # visible, or the caption describes an animal-free scene.
+                # Catches YOLO hallucinating a "dog" from shadows or the
+                # doormat pattern.
+                if vlm_says_absent or should_suppress(detected_classes, description):
                     logging.info(
                         "Suppressing alert: AI says no animal present. "
                         f"YOLO classes were {detected_classes}, "
@@ -845,16 +786,29 @@ try:
                 # Fetch weather data
                 temp, weather, icon = fetch_weather_data()
 
+                # Report what the VLM caption says is there, not YOLO's raw
+                # label — the nano model loves calling the cat a cow/elephant/
+                # giraffe. With no caption, lookalike labels are hedged to cat.
+                reported_classes, correction_note = resolve_reported_classes(
+                    detected_classes, description)
+                if reported_classes != detected_classes:
+                    logging.info(
+                        f"Reporting {reported_classes} — YOLO's raw labels "
+                        f"were {detected_classes}."
+                    )
+
                 # Subject is generic — Florence-2 doesn't generate titles. The
                 # rich content goes in the body + GIF attachment.
                 eastern_now = datetime.now(timezone('US/Eastern'))
                 time_str = eastern_now.strftime('%-I:%M %p ET')
-                if len(detected_classes) == 1:
-                    subject = f"{detected_classes[0].title()} at the door 🐾"
+                if len(reported_classes) == 1:
+                    subject = f"{reported_classes[0].title()} at the door 🐾"
                 else:
-                    subject = f"Spotted: {', '.join(detected_classes)} 🐾"
+                    subject = f"Spotted: {', '.join(reported_classes)} 🐾"
 
-                body_lines = [f"{time_str} · {', '.join(detected_classes)}"]
+                body_lines = [f"{time_str} · {', '.join(reported_classes)}"]
+                if correction_note:
+                    body_lines.append(correction_note)
                 if description:
                     body_lines.append("")
                     body_lines.append(description)
@@ -863,14 +817,18 @@ try:
                     body_lines.append(f"Weather: {temp:.0f}°F, {weather}")
                 message = "\n".join(body_lines)
 
-                # Email gets both still + GIF; Pushover prefers the GIF.
+                # Email gets both still + GIF (GIF animates in mail clients).
+                # Pushover gets the STILL JPEG — smartwatches (Apple Watch,
+                # Wear OS, Pixel Watch) reliably preview static images but
+                # often render GIFs as a blank frame in their tiny notification
+                # surface, killing the at-a-glance preview.
                 attachments = [full_image_path]
                 if gif_path and os.path.exists(gif_path):
                     attachments.append(gif_path)
-                pushover_attachment = gif_path if (gif_path and os.path.exists(gif_path)) else full_image_path
+                pushover_attachment = full_image_path
 
                 settings = get_notification_settings()
-                if 'cat' in detected_classes:
+                if 'cat' in reported_classes:
                     send_email_with_attachments(
                         image_paths=attachments,
                         subject=subject,
@@ -899,7 +857,7 @@ try:
 
                 upload_detection_to_supabase(
                     timestamp, description, full_image_path,
-                    detected_classes, detectionTemp=temp,
+                    reported_classes, detectionTemp=temp,
                     detectionWeather=weather, detectionIcon=icon,
                 )
 
