@@ -63,6 +63,39 @@ def crop_animal(image, bbox, pad_frac=DEFAULT_PAD_FRAC):
     return image.crop((x1, y1, x2, y2))
 
 
+def crop_with_context(image, bbox, pad_frac=0.5, min_frac=0.4):
+    """Crop around a bbox while keeping surrounding context, or return the
+    image unchanged when there's no usable box.
+
+    Unlike crop_animal (which crops tight, for embedding), this keeps enough
+    scene for a captioner to say what the animal is DOING and where. Two
+    knobs pulling opposite ways: pad_frac widens around the box, min_frac is
+    a floor on the result as a fraction of each frame dimension so a distant
+    animal's tiny box doesn't become a handful of pixels.
+
+    Crops that would overflow an edge are SHIFTED inward rather than
+    shrunk, so an animal at the frame edge still yields a full-size crop
+    instead of a clipped sliver."""
+    if bbox is None:
+        return image
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    if x2 <= x1 or y2 <= y1:
+        return image
+
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    # Full width/height of the crop, floored at min_frac of the frame and
+    # capped at the frame itself.
+    out_w = min(float(image.width),
+                max((x2 - x1) * (1.0 + pad_frac), image.width * min_frac))
+    out_h = min(float(image.height),
+                max((y2 - y1) * (1.0 + pad_frac), image.height * min_frac))
+
+    left = min(max(0.0, cx - out_w / 2.0), image.width - out_w)
+    top = min(max(0.0, cy - out_h / 2.0), image.height - out_h)
+    return image.crop((int(round(left)), int(round(top)),
+                       int(round(left + out_w)), int(round(top + out_h))))
+
+
 def load_clip(model_name='ViT-B-32-quickgelu', pretrained='openai',
               num_threads=None):
     """Load and cache the CLIP image encoder. Idempotent per (model,

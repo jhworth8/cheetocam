@@ -131,6 +131,17 @@ FLORENCE_GRACE_AFTER_GIF = float(os.getenv('FLORENCE_GRACE_AFTER_GIF', '30'))
 # and measured caption times are 27-33s, so a bare 30s would start timing out
 # and falling back to Gemini. Keep the total roughly the same.
 FLORENCE_TIMEOUT_NO_GIF = float(os.getenv('FLORENCE_TIMEOUT_NO_GIF', '55'))
+# Crop the frame around the animal before captioning. Florence was being
+# handed the whole 640x480 porch, where the cat is a small fraction of the
+# pixels — which is why captions ramble about flags, flower pots and clear
+# blue skies, and why its species guess was so unreliable. Padding is
+# deliberately generous: the point of the caption is what the cat is DOING,
+# so it still needs to see the porch, just not be dominated by it.
+FLORENCE_CROP_PAD_FRAC = float(os.getenv('FLORENCE_CROP_PAD_FRAC', '0.5'))
+# Never hand Florence a postage stamp — expand the crop to at least this
+# fraction of each frame dimension. A distant cat gives a tiny box, and a
+# 40px crop upscaled to Florence's input is mush.
+FLORENCE_CROP_MIN_FRAC = float(os.getenv('FLORENCE_CROP_MIN_FRAC', '0.4'))
 ENABLE_FLORENCE = int(os.getenv('ENABLE_FLORENCE', '1'))
 
 # Cheeto prototype (see train_cheeto_prototype.py). A CLIP vector averaged
@@ -501,15 +512,23 @@ def _downscaled_jpeg_b64(image_path, max_dim):
     img.save(buf, format='JPEG', quality=85)
     return base64.b64encode(buf.getvalue()).decode('utf-8')
 
-def get_florence_description(image_path, detected_classes):
-    """Run Florence-2 on the captured image. Returns the generated caption
-    string, or '' on failure. Florence-2 doesn't follow free-form prompts —
-    it takes a fixed task token (FLORENCE_TASK) and produces a caption."""
+def crop_for_caption(image, bbox):
+    """Crop a frame around the animal for captioning. Thin wrapper binding
+    the Florence-specific padding to the shared, unit-tested helper."""
+    return crop_with_context(image, bbox, FLORENCE_CROP_PAD_FRAC,
+                             FLORENCE_CROP_MIN_FRAC)
+
+
+def get_florence_description(image, detected_classes):
+    """Run Florence-2 on an already-loaded PIL image (normally the animal
+    crop, see crop_for_caption). Returns the generated caption string, or ''
+    on failure. Florence-2 doesn't follow free-form prompts — it takes a
+    fixed task token (FLORENCE_TASK) and produces a caption."""
     if not ENABLE_FLORENCE or _FLORENCE_MODEL is None or _FLORENCE_PROCESSOR is None:
         return ""
     try:
         import torch
-        image = PIL.Image.open(image_path).convert('RGB')
+        image = image.convert('RGB')
         inputs = _FLORENCE_PROCESSOR(
             text=FLORENCE_TASK, images=image, return_tensors="pt"
         )
@@ -541,9 +560,9 @@ class _CaptionThread(threading.Thread):
     """Background worker that fetches a Florence-2 caption. Started right
     when YOLO fires so the VLM runs in parallel with the 5-frame GIF burst;
     the main loop joins it after the burst."""
-    def __init__(self, image_path, detected_classes):
+    def __init__(self, image, detected_classes):
         super().__init__(daemon=True)
-        self.image_path = image_path
+        self.image = image
         self.detected_classes = detected_classes
         self.description = ""
         self.started_at = time.time()
@@ -551,7 +570,7 @@ class _CaptionThread(threading.Thread):
 
     def run(self):
         self.description = get_florence_description(
-            self.image_path, self.detected_classes)
+            self.image, self.detected_classes)
         self.finished_at = time.time()
         elapsed = self.finished_at - self.started_at
         if self.description:
@@ -788,10 +807,19 @@ try:
                 # — but only if the user has local AI enabled. Otherwise we'd
                 # waste 30+s of CPU on a Florence-2 inference we'd throw away
                 # in favor of Gemini.
+                # One YOLO pass on the settled frame, shared by the caption
+                # crop and the prototype. Re-run rather than reuse the trigger
+                # frame's box: this frame is POST_DETECTION_SETTLE_FRAMES
+                # later and the cat has usually moved since.
+                animal_bbox = best_animal_bbox(frame)
+
                 early_settings = get_notification_settings()
                 use_local = early_settings.get('use_local_ai', True)
                 if use_local:
-                    caption_thread = _CaptionThread(full_image_path, detected_classes)
+                    caption_image = crop_for_caption(
+                        PIL.Image.open(full_image_path).convert('RGB'),
+                        animal_bbox)
+                    caption_thread = _CaptionThread(caption_image, detected_classes)
                     caption_thread.start()
                 else:
                     caption_thread = None
@@ -858,9 +886,8 @@ try:
                 # doesn't cost a CLIP inference.
                 cheeto_verdict, cheeto_score = 'unknown', 0.0
                 if _CHEETO_PROTOTYPE and identify_cheeto:
-                    bbox = best_animal_bbox(frame)
                     cheeto_verdict, cheeto_score = identify_cheeto(
-                        full_image_path, bbox, _CHEETO_PROTOTYPE,
+                        full_image_path, animal_bbox, _CHEETO_PROTOTYPE,
                         num_threads=CHEETO_ID_THREADS,
                     )
                     logging.info(
