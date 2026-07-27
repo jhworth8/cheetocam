@@ -1,0 +1,19 @@
+# Mirrors /etc/systemd/system/cat_detector.service as actually installed on
+# the Pi. The unit is named cat_detector (underscore) — `systemctl restart
+# cat-detector` with a hyphen silently reports "inactive" against a unit that
+# doesn't exist, which looks exactly like a stopped detector.
+[Unit]
+Description=Cat Detector Service
+After=network.target
+
+[Service]
+Type=simple
+User=jesse
+WorkingDirectory=/home/jesse/cheetocam
+ExecStart=/usr/bin/python3 /home/jesse/cheetocam/cat_detector_yolo_gemini_yolo11.py
+Restart=always
+RestartSec=5
+Environment=PATH=/usr/bin:/usr/local/bin
+
+[Install]
+WantedBy=multi-user.target
