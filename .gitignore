@@ -17,3 +17,8 @@ cheeto_contact_sheet.html
 # putting 5MB binaries in git.
 yolo11n.pt
 yolov8n.pt
+
+# The Pi's virtualenv. The systemd unit runs /usr/bin/python3, not this, but
+# it sits in the working tree and makes `git status` look dirty — which is
+# what disguises a genuinely dirty tree before a deploy.
+venv/
