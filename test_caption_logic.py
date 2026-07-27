@@ -18,16 +18,115 @@ def test_cow_label_corrected_to_cat_by_caption():
     for wrong in (['cow'], ['elephant'], ['giraffe'], ['zebra', 'cow']):
         caption = "A large orange cat is sitting on a striped mat by the door."
         assert not should_suppress(wrong, caption)
-        reported, note = resolve_reported_classes(wrong, caption)
+        reported, note, hedged = resolve_reported_classes(wrong, caption)
         assert reported == ['cat'], f"{wrong} -> {reported}"
-        assert note and 'detector guessed' in note
+        assert not hedged
+
+
+def test_notes_never_leak_yolos_wrong_label():
+    # The user sees these notes. "(detector guessed: elephant)" is noise.
+    for wrong in (['cow'], ['elephant'], ['bear']):
+        for caption in ("An orange cat by the door.", "", "A fox on the mat."):
+            _, note, _ = resolve_reported_classes(wrong, caption)
+            if note:
+                assert wrong[0] not in note, f"{wrong} leaked into {note!r}"
 
 
 def test_lookalike_with_no_caption_hedges_to_cat():
     # Both VLMs failed: never report "Elephant at the door", hedge to cat.
-    reported, note = resolve_reported_classes(['elephant'], "")
+    reported, note, hedged = resolve_reported_classes(['elephant'], "")
     assert reported == ['cat']
     assert note and 'unverified' in note
+
+
+def test_small_critter_contradicting_big_yolo_box_is_the_cat():
+    # The reported bug: "Squirrel at the door! (guessed bear)". A red squirrel
+    # cannot produce a bear-sized box — that blob is Cheeto.
+    for wrong in (['bear'], ['cow'], ['elephant'], ['giraffe', 'horse']):
+        for caption in ("A red squirrel sitting on the porch.",
+                        "A small rabbit near the doorway."):
+            reported, _, hedged = resolve_reported_classes(wrong, caption)
+            assert reported == ['cat'], f"{wrong} + {caption!r} -> {reported}"
+            assert not hedged
+
+
+def test_real_squirrel_with_plausible_yolo_label_is_reported():
+    # YOLO saying 'cat' on a squirrel is a normal, size-consistent mistake —
+    # no contradiction, so the caption stands.
+    caption = "A red squirrel is eating a nut on the railing."
+    reported, _, _ = resolve_reported_classes(['cat'], caption)
+    assert reported == ['squirrel']
+
+
+def test_speculative_species_from_florence_is_hedged():
+    # Fox is cat-sized, so there's no size contradiction to overrule it — but
+    # Florence-2-base guesses wild species, so don't assert it.
+    caption = "A fox standing on the porch steps."
+    reported, _, hedged = resolve_reported_classes(['bear'], caption, 'florence')
+    assert reported == ['fox']
+    assert hedged
+
+
+def test_speculative_species_from_gemini_is_not_hedged():
+    caption = "A fox standing on the porch steps."
+    reported, _, hedged = resolve_reported_classes(['bear'], caption, 'gemini')
+    assert reported == ['fox']
+    assert not hedged
+
+
+def test_cheeto_prototype_match_overrides_a_bad_caption():
+    # The prototype is trained on THIS cat; a 230M captioner is not. When it
+    # fires, nothing the caption claims about species should survive.
+    for caption in ("A red squirrel on the porch.",
+                    "A fox standing by the door.",
+                    "A raccoon eating from a bowl."):
+        reported, _, hedged = resolve_reported_classes(
+            ['bear'], caption, 'florence', 'cheeto')
+        assert reported == ['cat'], f"{caption!r} -> {reported}"
+        assert not hedged
+
+
+def test_cheeto_match_wins_even_with_no_caption():
+    reported, note, hedged = resolve_reported_classes([], "", None, 'cheeto')
+    assert reported == ['cat']
+    assert note is None and not hedged
+
+
+def test_not_cheeto_disables_the_small_critter_override():
+    # Size contradiction says "that's the cat", but the prototype actively
+    # disagreed — real evidence beats an inference about box size.
+    reported, _, _ = resolve_reported_classes(
+        ['bear'], "A red squirrel on the railing.", 'gemini', 'not_cheeto')
+    assert reported == ['squirrel']
+
+
+def test_not_cheeto_with_no_caption_is_flagged_uncertain():
+    reported, note, hedged = resolve_reported_classes(
+        ['cow'], "", None, 'not_cheeto')
+    assert reported == ['cat']
+    assert note and 'may not be' in note
+    assert hedged
+
+
+def test_unknown_verdict_behaves_exactly_like_no_prototype():
+    # Untrained or failed ID must not change any existing decision.
+    cases = [
+        (['bear'], "A red squirrel on the porch.", 'florence'),
+        (['cow'], "An orange cat by the door.", 'florence'),
+        (['elephant'], "", None),
+        (['cat'], "A gray tabby cat on the mat.", 'gemini'),
+    ]
+    for classes, caption, source in cases:
+        assert (resolve_reported_classes(classes, caption, source, 'unknown')
+                == resolve_reported_classes(classes, caption, source, None))
+
+
+def test_confident_species_beats_speculative_in_same_caption():
+    # "fox-like orange cat" is one cat, not a cat AND a fox.
+    caption = "An orange cat with a bushy fox-like tail sits by the door."
+    reported, _, hedged = resolve_reported_classes(['cow'], caption, 'florence')
+    assert reported == ['cat']
+    assert not hedged
 
 
 def test_lookalike_with_animal_free_caption_is_suppressed():
@@ -49,9 +148,10 @@ def test_short_or_empty_caption_never_suppresses():
 def test_real_cat_caption_passes_through():
     caption = "A gray tabby cat walking across the snowy porch."
     assert not should_suppress(['cat'], caption)
-    reported, note = resolve_reported_classes(['cat'], caption)
+    reported, note, hedged = resolve_reported_classes(['cat'], caption)
     assert reported == ['cat']
     assert note is None
+    assert not hedged
 
 
 def test_negation_still_suppresses():
@@ -66,9 +166,8 @@ def test_person_without_animal_suppresses():
 
 def test_caption_names_animal_yolo_has_no_class_for():
     caption = "A raccoon is eating from a bowl on the porch."
-    reported, note = resolve_reported_classes(['dog'], caption)
+    reported, note, _ = resolve_reported_classes(['dog'], caption)
     assert reported == ['raccoon']
-    assert note and 'detector guessed' in note
     # A raccoon caption is an animal — must NOT be suppressed.
     assert not should_suppress(['dog'], caption)
 

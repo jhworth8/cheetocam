@@ -17,6 +17,24 @@ LOOKALIKE_ANIMAL_CLASSES = ['horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra'
 
 ANIMAL_CLASSES = PLAUSIBLE_ANIMAL_CLASSES + LOOKALIKE_ANIMAL_CLASSES
 
+# Fine-grained wild species. Florence-2-base (230M) reliably tells cat from
+# dog from bird, but on anything beyond that its species name is a guess, and
+# on a dark porch frame an orange tabby is its favourite fox/squirrel. These
+# are still reported — a raccoon really does visit — but never asserted
+# flatly; the caller hedges the wording when the caption came from the local
+# model. Gemini is trusted to name them outright.
+SPECULATIVE_CAPTION_ANIMALS = [
+    'raccoon', 'opossum', 'fox', 'skunk', 'squirrel', 'rabbit', 'deer',
+]
+
+# Critters far smaller than a cat. Every LOOKALIKE class is a large quadruped,
+# so for the nano model to fire one it had to see a big animal-shaped blob
+# filling real frame area — which a squirrel or a rabbit physically cannot
+# produce at porch distance. "YOLO: bear" + "caption: red squirrel" is
+# therefore a size contradiction, and the only thing that makes that box is
+# the cat.
+SMALL_CRITTERS = ['squirrel', 'rabbit']
+
 _ANIMAL_VOCAB = [
     'cat', 'cats', 'kitten', 'feline', 'tabby', 'kitty',
     'dog', 'dogs', 'puppy', 'canine', 'hound', 'pup',
@@ -117,26 +135,65 @@ def should_suppress(detected_classes, description):
     return False
 
 
-def resolve_reported_classes(detected_classes, description):
+def resolve_reported_classes(detected_classes, description, caption_source=None,
+                             cheeto_verdict=None):
     """Decide what animal to REPORT, given YOLO's labels and the VLM caption.
 
-    The caption wins when it names an animal. Otherwise plausible YOLO labels
-    are reported as-is and lookalike-only labels are hedged to 'cat'.
-    Returns (classes_to_report, note_or_None); the note is a short
-    transparency line for the notification body when we overrode YOLO."""
+    The caption wins when it names an animal, but not blindly: a weak local
+    caption naming a fine-grained wild species is treated as a guess, and a
+    guess that contradicts the size of YOLO's box is overruled outright.
+
+    caption_source is 'florence' (weak local model), 'gemini' (trusted), or
+    None. cheeto_verdict is 'cheeto' / 'not_cheeto' / 'unknown' / None from
+    cheeto_id.identify(). Returns (classes_to_report, note_or_None, hedged).
+      note   — short transparency line for the notification body, or None.
+               Deliberately never repeats YOLO's raw wrong label; that's
+               noise to the reader and lives in the log instead.
+      hedged — True when the species is a guess, so the caller should say
+               "Possible fox at the door" rather than "Fox at the door"."""
     detected_unique = list(dict.fromkeys(detected_classes))
     caption_animals = animals_in_caption(description)
+
+    # A prototype match outranks everything. It's the only signal here trained
+    # on THIS cat rather than on cats in general, so when it fires we don't
+    # care what a 230M captioner thought it saw. The caption still ships in
+    # the notification body — it's the species claim we're overriding, not
+    # the description.
+    if cheeto_verdict == 'cheeto':
+        return ['cat'], None, False
+
     if caption_animals:
-        if set(caption_animals) != set(detected_unique):
-            return caption_animals, f"(detector guessed: {', '.join(detected_unique)})"
-        return caption_animals, None
+        # A caption naming both a confident and a speculative species ("an
+        # orange cat, almost fox-like") is one animal, not two — the species
+        # the model actually knows wins.
+        confident = [a for a in caption_animals
+                     if a not in SPECULATIVE_CAPTION_ANIMALS]
+        if confident:
+            return confident, None, False
+
+        # Size contradiction: only large-quadruped labels from YOLO, but the
+        # caption named a critter far too small to have produced that box.
+        # Skipped when the prototype actively says this ISN'T the cat —
+        # that's better evidence than an inference about box size.
+        if (cheeto_verdict != 'not_cheeto'
+                and detected_unique
+                and all(c in LOOKALIKE_ANIMAL_CLASSES for c in detected_unique)
+                and any(a in SMALL_CRITTERS for a in caption_animals)):
+            return ['cat'], None, False
+
+        # A wild species the local model guessed at. Report it, but say so.
+        return caption_animals, None, caption_source == 'florence'
 
     plausible = [c for c in detected_unique if c in PLAUSIBLE_ANIMAL_CLASSES]
     if plausible:
-        return plausible, None
+        return plausible, None, False
 
-    # Only lookalike labels and no usable caption: almost certainly the cat.
-    return ['cat'], f"(unverified — detector guessed {', '.join(detected_unique)})"
+    # Only lookalike labels and no usable caption. Normally that's the cat,
+    # but if the prototype disagreed we say so rather than quietly asserting
+    # a cat the classifier just rejected.
+    if cheeto_verdict == 'not_cheeto':
+        return ['cat'], "(unverified — may not be Cheeto)", True
+    return ['cat'], "(unverified — no clear look at the animal)", False
 
 
 def build_confirmation_prompt(detected_classes):

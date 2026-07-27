@@ -5,3 +5,15 @@
 serviceAccountKey.json
 __pycache__/
 *.pyc
+
+# Training scratch: hundreds of cached detection frames and the audit sheet.
+# cheeto_prototype.npz is deliberately NOT ignored — it's ~2KB and riding
+# along in git is the simplest way to deploy it to the Pi.
+.cheeto_cache/
+cheeto_contact_sheet.html
+
+# YOLO checkpoints — ultralytics re-downloads these by name, and the same
+# name is the same published file, so training stays reproducible without
+# putting 5MB binaries in git.
+yolo11n.pt
+yolov8n.pt

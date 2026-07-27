@@ -125,7 +125,24 @@ FLORENCE_NUM_BEAMS = int(os.getenv('FLORENCE_NUM_BEAMS', '1'))  # 1 = greedy (fa
 # Extra grace period to wait for Florence after the GIF burst finishes.
 # If it hasn't returned by then, fall back to Gemini.
 FLORENCE_GRACE_AFTER_GIF = float(os.getenv('FLORENCE_GRACE_AFTER_GIF', '30'))
+# How long to wait for Florence when the GIF burst is SKIPPED. The burst is
+# what normally gives Florence its headroom: ~25s of capture plus the grace
+# above, ~55s total. Drop the burst and the grace alone is the whole budget —
+# and measured caption times are 27-33s, so a bare 30s would start timing out
+# and falling back to Gemini. Keep the total roughly the same.
+FLORENCE_TIMEOUT_NO_GIF = float(os.getenv('FLORENCE_TIMEOUT_NO_GIF', '55'))
 ENABLE_FLORENCE = int(os.getenv('ENABLE_FLORENCE', '1'))
+
+# Cheeto prototype (see train_cheeto_prototype.py). A CLIP vector averaged
+# from our own library of this cat, which answers "is this Cheeto?" far better
+# than any general model can — it's the only signal here trained on THIS cat.
+# Off until a prototype file exists; without one the detector behaves exactly
+# as it did before.
+CHEETO_PROTOTYPE_PATH = os.getenv('CHEETO_PROTOTYPE_PATH', 'cheeto_prototype.npz')
+ENABLE_CHEETO_ID = int(os.getenv('ENABLE_CHEETO_ID', '1'))
+# CLIP shares the Pi's 4 cores with Florence. Leave one free so a detection
+# doesn't starve the capture loop and drop frames.
+CHEETO_ID_THREADS = int(os.getenv('CHEETO_ID_THREADS', '3'))
 # Drain this many frames immediately after a YOLO hit before saving the
 # "detection frame", so USB auto-exposure has a moment to settle. Subsequent
 # GIF frames are 5s later so they're always settled.
@@ -553,7 +570,7 @@ def _call_gemini_for_description(image_path, detected_classes):
     confirmed, description = parse_gemini_confirmation(resp, detected_classes)
     return description.strip(), (not confirmed)
 
-def resolve_caption(thread, image_path, detected_classes):
+def resolve_caption(thread, image_path, detected_classes, grace=None):
     """Wait for the Florence-2 thread (with a grace period after GIF capture),
     then fall back to Gemini if Florence returned nothing OR if the user has
     disabled local AI via the dashboard. Returns (description, source,
@@ -569,7 +586,7 @@ def resolve_caption(thread, image_path, detected_classes):
         logging.info("Local AI disabled and Gemini fallback off — no caption; label will hedge to cat.")
         return "", "none", False
 
-    thread.join(timeout=FLORENCE_GRACE_AFTER_GIF)
+    thread.join(timeout=FLORENCE_GRACE_AFTER_GIF if grace is None else grace)
     if thread.description:
         return thread.description, "florence", False
     if ENABLE_GEMINI_FALLBACK:
@@ -679,6 +696,43 @@ logging.info("Camera initialized.")
 # the local VLM ready, per explicit configuration.
 load_florence_blocking()
 
+# Load the Cheeto prototype. A missing file is not an error — it just means
+# the prototype hasn't been trained yet and species ID falls back to the
+# caption, exactly as the detector behaved before.
+_CHEETO_PROTOTYPE = None
+identify_cheeto = None
+if ENABLE_CHEETO_ID:
+    try:
+        from cheeto_id import load_prototype, identify as identify_cheeto
+        _CHEETO_PROTOTYPE = load_prototype(CHEETO_PROTOTYPE_PATH)
+        if _CHEETO_PROTOTYPE:
+            logging.info(
+                f"Cheeto prototype loaded from {CHEETO_PROTOTYPE_PATH} "
+                f"({_CHEETO_PROTOTYPE['n_images']} training crops, "
+                f"threshold {_CHEETO_PROTOTYPE['threshold']:.3f})."
+            )
+        else:
+            logging.info(
+                f"No Cheeto prototype at {CHEETO_PROTOTYPE_PATH} — species ID "
+                "falls back to the caption. Run train_cheeto_prototype.py."
+            )
+    except Exception as e:
+        logging.error(f"Cheeto ID unavailable: {e}")
+
+
+def best_animal_bbox(frame):
+    """Highest-confidence animal box in a frame, or None. Re-runs YOLO rather
+    than reusing the trigger frame's box: the saved frame is captured
+    POST_DETECTION_SETTLE_FRAMES later, by which point the cat has moved."""
+    try:
+        for det in sorted(detect_objects_yolo11(frame),
+                          key=lambda d: d['confidence'], reverse=True):
+            if det['class'] in ANIMAL_CLASSES:
+                return det['bbox']
+    except Exception as e:
+        logging.error(f"Bounding box lookup failed: {e}")
+    return None
+
 logging.info("Beginning main loop...")
 
 cooldown_end_time = 0.0
@@ -742,18 +796,33 @@ try:
                 else:
                     caption_thread = None
 
-                # Capture the burst GIF (~20s of action).
-                gif_path = f'detection_{timestamp}.gif'
-                try:
-                    capture_burst_gif(cap, frame, gif_path)
-                except Exception as e:
-                    logging.error(f"GIF capture failed: {e}")
-                    gif_path = None
+                # Capture the burst GIF (~25s of action) — but only when email
+                # is on, because email is the ONLY channel it ever reaches.
+                # Pushover deliberately gets the still (smartwatches render
+                # GIFs as a blank frame). With email off we were spending 25s
+                # of camera reads and CPU building a file we then deleted
+                # unsent, starving Florence of cores on a 4-core Pi.
+                gif_path = None
+                if early_settings['email_enabled']:
+                    gif_path = f'detection_{timestamp}.gif'
+                    try:
+                        capture_burst_gif(cap, frame, gif_path)
+                    except Exception as e:
+                        logging.error(f"GIF capture failed: {e}")
+                        gif_path = None
+                else:
+                    logging.info(
+                        "Email disabled — skipping the GIF burst (it only ever "
+                        "goes out by email)."
+                    )
 
-                # Wait for Florence-2 (with grace period); fall back to Gemini
-                # if it hasn't returned anything by then.
+                # Wait for Florence-2, then fall back to Gemini if it hasn't
+                # returned. Without the burst there's no 25s of incidental
+                # headroom, so extend the wait to keep the total budget the
+                # same — otherwise a normal 33s caption starts timing out.
                 description, caption_source, vlm_says_absent = resolve_caption(
-                    caption_thread, full_image_path, detected_classes)
+                    caption_thread, full_image_path, detected_classes,
+                    grace=None if gif_path else FLORENCE_TIMEOUT_NO_GIF)
                 logging.info(
                     f"Caption source: {caption_source}; "
                     f"description={_safe_log_snippet(description)!r}"
@@ -783,28 +852,51 @@ try:
                     cooldown_end_time = current_time + 30
                     continue
 
+                # Ask the prototype whether this is Cheeto. Runs here rather
+                # than alongside Florence so it never delays the GIF burst,
+                # and only after the suppression check so a false positive
+                # doesn't cost a CLIP inference.
+                cheeto_verdict, cheeto_score = 'unknown', 0.0
+                if _CHEETO_PROTOTYPE and identify_cheeto:
+                    bbox = best_animal_bbox(frame)
+                    cheeto_verdict, cheeto_score = identify_cheeto(
+                        full_image_path, bbox, _CHEETO_PROTOTYPE,
+                        num_threads=CHEETO_ID_THREADS,
+                    )
+                    logging.info(
+                        f"Cheeto ID: {cheeto_verdict} (similarity "
+                        f"{cheeto_score:.3f} vs threshold "
+                        f"{_CHEETO_PROTOTYPE['threshold']:.3f})"
+                    )
+
                 # Fetch weather data
                 temp, weather, icon = fetch_weather_data()
 
                 # Report what the VLM caption says is there, not YOLO's raw
                 # label — the nano model loves calling the cat a cow/elephant/
                 # giraffe. With no caption, lookalike labels are hedged to cat.
-                reported_classes, correction_note = resolve_reported_classes(
-                    detected_classes, description)
+                reported_classes, correction_note, hedged = resolve_reported_classes(
+                    detected_classes, description, caption_source, cheeto_verdict)
                 if reported_classes != detected_classes:
                     logging.info(
-                        f"Reporting {reported_classes} — YOLO's raw labels "
-                        f"were {detected_classes}."
+                        f"Reporting {reported_classes} (hedged={hedged}) — "
+                        f"YOLO's raw labels were {detected_classes}."
                     )
 
                 # Subject is generic — Florence-2 doesn't generate titles. The
-                # rich content goes in the body + GIF attachment.
+                # rich content goes in the body + GIF attachment. "Possible"
+                # when the species came from a local-model guess: the alert
+                # should never assert a fox it isn't sure about.
                 eastern_now = datetime.now(timezone('US/Eastern'))
                 time_str = eastern_now.strftime('%-I:%M %p ET')
                 if len(reported_classes) == 1:
-                    subject = f"{reported_classes[0].title()} at the door 🐾"
+                    label = reported_classes[0]
+                    subject = (f"Possible {label} at the door 🐾" if hedged
+                               else f"{label.title()} at the door 🐾")
                 else:
-                    subject = f"Spotted: {', '.join(reported_classes)} 🐾"
+                    joined = ', '.join(reported_classes)
+                    subject = (f"Possibly spotted: {joined} 🐾" if hedged
+                               else f"Spotted: {joined} 🐾")
 
                 body_lines = [f"{time_str} · {', '.join(reported_classes)}"]
                 if correction_note:

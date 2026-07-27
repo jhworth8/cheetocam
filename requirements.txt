@@ -35,3 +35,6 @@ urllib3==2.2.3
 firebase-admin==6.0.0
 ultralytics>=8.3.0
 supabase==2.9.0
+# CLIP image encoder for cheeto_id.py. ~150MB of weights, loaded once and
+# kept resident; runs in ~1-2s per detection on the Pi 5 CPU.
+open_clip_torch>=2.24.0
