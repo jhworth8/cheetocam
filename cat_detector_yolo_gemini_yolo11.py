@@ -26,6 +26,11 @@ from caption_logic import (
     build_confirmation_prompt,
     parse_gemini_confirmation,
 )
+# Module level, NOT inside the ENABLE_CHEETO_ID block below: the caption crop
+# needs this whether or not prototype ID is switched on. cheeto_id only pulls
+# in numpy and PIL at import time (torch is loaded lazily inside functions),
+# so this stays cheap.
+from cheeto_id import crop_with_context
 
 # Silence the noisy "num_beams=1 with early_stopping=True" warning that
 # Florence-2's generation config triggers on every call. We use greedy
