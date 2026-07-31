@@ -12,6 +12,7 @@ from pytz import timezone
 import numpy as np
 import requests
 import base64
+import io
 import logging
 import PIL.Image
 import google.generativeai as genai
@@ -66,9 +67,24 @@ ENV_BOTHER_EMAIL = os.getenv('BOTHER_EMAIL', '').strip()
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 
-# Pushover credentials - hardcoded as requested
-PUSHOVER_USER_KEY = "ubr5phjr9wymwabf8sg1anmsj9a12k"
-PUSHOVER_API_TOKEN = "aqgxkbzacmm4mi8fpu49duzwnorfjf"
+# Two notification paths run in parallel.
+#
+# 1. Pushover — the proven one, kept running until the self-hosted path has
+#    earned trust. Credentials now come from .env (which is gitignored) rather
+#    than being hardcoded here, where they sat in a public repo.
+# 2. The self-hosted dispatcher on cheeto, which fans out to ntfy (Android, no
+#    third party at all) and APNs (iOS, Apple only, our own key). This box holds
+#    only a bearer token; the push credentials live on cheeto.
+#
+# Each can be switched off independently, so Pushover can be retired later by
+# flipping one env var rather than editing code.
+PUSHOVER_USER_KEY = os.getenv('PUSHOVER_USER_KEY', '')
+PUSHOVER_API_TOKEN = os.getenv('PUSHOVER_API_TOKEN', '')
+ENABLE_PUSHOVER = int(os.getenv('ENABLE_PUSHOVER', '1'))
+
+PUSH_DISPATCH_URL = os.getenv('PUSH_DISPATCH_URL', 'http://192.168.86.113:8090/push')
+PUSH_DISPATCH_TOKEN = os.getenv('PUSH_DISPATCH_TOKEN', '')
+ENABLE_DISPATCH_PUSH = int(os.getenv('ENABLE_DISPATCH_PUSH', '1'))
 
 ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))
 # Gemini cloud fallback for captions is OFF by default — the system is
@@ -392,14 +408,23 @@ def send_email_with_attachments(image_paths, subject, message, phone_recipients,
             logging.error(f"Failed to send to {recipient}: {e}")
 
 def send_pushover_notification(message, title="Detection Alert", image_path=None, priority=0):
-    """Send a Pushover notification.
+    """Send a Pushover notification (legacy path, still the trusted one).
+
+    image_path here is a LOCAL file — Pushover uploads the JPEG as a multipart
+    attachment. That differs from send_push_notification below, which takes a
+    Storage path instead. The local file still exists at call time; cleanup
+    happens after both notifiers have run.
 
     priority: -2 lowest .. 2 emergency. 0 = normal (respects quiet hours),
-    1 = high (bypasses quiet hours, highlighted). Default 0 — only escalate
-    for non-cat/unexpected detections.
+    1 = high (bypasses quiet hours, highlighted).
     """
+    if not ENABLE_PUSHOVER:
+        return
     if not get_notification_settings()['pushover_enabled']:
-        logging.info("Pushover notifications disabled via settings — skipping.")
+        logging.info("Push notifications disabled via settings — skipping Pushover.")
+        return
+    if not (PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN):
+        logging.error("Pushover credentials missing from .env — skipping Pushover.")
         return
     try:
         files = {}
@@ -424,6 +449,52 @@ def send_pushover_notification(message, title="Detection Alert", image_path=None
             logging.error("Failed to send Pushover notification: %s", response.text)
     except Exception as e:
         logging.error("Error sending Pushover notification: %s", e)
+
+def send_push_notification(message, title="Detection Alert", image_path=None, priority=0):
+    """Hand an alert to the self-hosted dispatcher on cheeto.
+
+    image_path is a Storage path such as 'detections/thumb/20260730_160459.jpg',
+    NOT a local file — the dispatcher turns it into a public URL that the phone
+    fetches directly. The thumbnail is deliberately used rather than the full
+    frame: it is about a fifth the bytes and renders identically in a
+    notification shade or on a watch face.
+
+    priority: 0 = normal, 1 = high. Kept identical to the old Pushover
+    semantics so the call site and the settings toggle did not have to change.
+
+    The settings flag is still called pushover_enabled — the column name is
+    shared with the website and the app, so renaming it would break both for
+    no functional gain.
+    """
+    if not ENABLE_DISPATCH_PUSH:
+        return
+    if not get_notification_settings()['pushover_enabled']:
+        logging.info("Push notifications disabled via settings — skipping dispatcher.")
+        return
+    if not PUSH_DISPATCH_TOKEN:
+        logging.error("PUSH_DISPATCH_TOKEN is unset — cannot send push.")
+        return
+    try:
+        payload = {
+            "title": title,
+            "body": message,
+            "priority": priority,
+        }
+        if image_path:
+            payload["image_path"] = image_path
+        response = requests.post(
+            PUSH_DISPATCH_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {PUSH_DISPATCH_TOKEN}"},
+            timeout=30,
+        )
+        if response.status_code == 200:
+            logging.info("Push dispatched: %s", response.text[:200])
+        else:
+            logging.error("Push dispatcher returned %s: %s",
+                          response.status_code, response.text[:200])
+    except Exception as e:
+        logging.error("Error dispatching push notification: %s", e)
 
 def get_gemini_response(image_path, prompt):
     if not ENABLE_GEMINI:
@@ -621,30 +692,66 @@ def resolve_caption(thread, image_path, detected_classes, grace=None):
     return "", "none", False
 
 def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, detected_classes=None, detectionTemp=None, detectionWeather=None, detectionIcon=None):
+    """Insert the detection row and put the image in Supabase Storage.
+
+    Images used to be base64 stuffed into the row (~220KB of text each), which
+    made the table 857MB and meant a phone had to download a full frame just to
+    draw a grid thumbnail. They now go to the `detections` bucket as real files,
+    with a 400px thumbnail alongside.
+
+    Filenames are keyed on the detection timestamp rather than the row id, so
+    the upload can happen before the insert and no second round trip is needed.
+    The cooldown is minutes long, so same-second collisions are not a concern.
+
+    Returns {'image_path', 'thumb_path'} on success, else None — the caller
+    passes the thumbnail path to the push dispatcher.
+    """
     if not ENABLE_SUPABASE_UPLOAD:
-        return
+        return None
     try:
+        name = f"{timestamp}.jpg"
+        image_path = f"detections/{name}"
+        thumb_path = f"detections/thumb/{name}"
+
         with open(main_image_path, 'rb') as f:
-            image_data = f.read()
-        image_base64 = base64.b64encode(image_data).decode('utf-8')
-        epoch = int(time.time())
-        
+            raw = f.read()
+
+        im = PIL.Image.open(io.BytesIO(raw)).convert('RGB')
+        im.thumbnail((400, 400), PIL.Image.LANCZOS)
+        tbuf = io.BytesIO()
+        im.save(tbuf, format='JPEG', quality=80, optimize=True)
+
+        headers = {
+            'apikey': SUPABASE_ANON_KEY,
+            'Authorization': f'Bearer {SUPABASE_ANON_KEY}',
+            'Content-Type': 'image/jpeg',
+            'x-upsert': 'true',
+        }
+        for path, blob in ((image_path, raw), (thumb_path, tbuf.getvalue())):
+            r = requests.post(f"{SUPABASE_URL}/storage/v1/object/{path}",
+                              headers=headers, data=blob, timeout=60)
+            if r.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"storage upload {path} failed: {r.status_code} {r.text[:160]}")
+
         detection_data = {
             'timestamp': timestamp,
-            'epoch': epoch,
+            'epoch': int(time.time()),
             'gemini_response': gemini_response,
-            'main_image': image_base64,
+            'image_path': image_path,
+            'thumb_path': thumb_path,
             'detectiontemp': detectionTemp,
             'detectionweather': detectionWeather,
             'detectionicon': detectionIcon
         }
         response = supabase_client.table("detections").insert(detection_data).execute()
-        # Don't log the full response — it echoes the inserted row including the
-        # base64 main_image column, which floods journald. Log just the row count.
         inserted = len(getattr(response, 'data', None) or [])
-        logging.info(f"Detection uploaded to Supabase ({inserted} row inserted).")
+        logging.info(
+            f"Detection uploaded ({inserted} row, image + thumb in Storage as {name}).")
+        return {'image_path': image_path, 'thumb_path': thumb_path}
     except Exception as e:
         logging.error(f"Error uploading to Supabase: {e}")
+        return None
 
 def detect_objects_yolo11(frame):
     """Detect objects using YOLOv11."""
@@ -716,6 +823,18 @@ if not cap.isOpened():
 
 logging.info("Camera initialized.")
 
+# On-demand live view. /dev/video0 only allows one reader and this process owns
+# it, so the stream re-serves the frames already being decoded for YOLO rather
+# than opening the camera a second time. Import and start are both guarded:
+# a live view problem must never stop detection.
+try:
+    import live_stream
+    live_stream.start(port=int(os.getenv('STREAM_PORT', '8088')),
+                      token=os.getenv('STREAM_TOKEN', ''))
+except Exception as _exc:
+    live_stream = None
+    logging.error("Live view unavailable: %s", _exc)
+
 # Block until Florence-2 is loaded — the detector should never alert without
 # the local VLM ready, per explicit configuration.
 load_florence_blocking()
@@ -769,6 +888,12 @@ try:
         if not ret:
             logging.error("Frame grab failed.")
             break
+
+        # Hand the frame to the live view. Stores a reference only — no copy and
+        # no JPEG encode — so this costs effectively nothing when nobody is
+        # watching, and encoding happens on the serving thread when they are.
+        if live_stream is not None:
+            live_stream.publish(frame)
 
         current_time = time.time()
 
@@ -942,14 +1067,14 @@ try:
                 message = "\n".join(body_lines)
 
                 # Email gets both still + GIF (GIF animates in mail clients).
-                # Pushover gets the STILL JPEG — smartwatches (Apple Watch,
+                # Push gets the STILL JPEG thumbnail — smartwatches (Apple Watch,
                 # Wear OS, Pixel Watch) reliably preview static images but
                 # often render GIFs as a blank frame in their tiny notification
-                # surface, killing the at-a-glance preview.
+                # surface, killing the at-a-glance preview. That still now comes
+                # from Storage rather than being attached to the request.
                 attachments = [full_image_path]
                 if gif_path and os.path.exists(gif_path):
                     attachments.append(gif_path)
-                pushover_attachment = full_image_path
 
                 settings = get_notification_settings()
                 if 'cat' in reported_classes:
@@ -972,17 +1097,32 @@ try:
                         )
                     push_priority = 1
 
-                send_pushover_notification(
-                    message=message,
-                    title=subject,
-                    image_path=pushover_attachment,
-                    priority=push_priority,
-                )
-
-                upload_detection_to_supabase(
+                # Upload runs FIRST now: the push references the image by its
+                # Storage path, so the file has to exist before the alert goes
+                # out. Previously the push carried the JPEG as an attachment and
+                # order did not matter.
+                storage = upload_detection_to_supabase(
                     timestamp, description, full_image_path,
                     reported_classes, detectionTemp=temp,
                     detectionWeather=weather, detectionIcon=icon,
+                )
+
+                # Both notifiers fire while the self-hosted path is on trial, so
+                # expect two alerts per detection until ENABLE_PUSHOVER is set
+                # to 0. Pushover attaches the LOCAL jpeg; the dispatcher refers
+                # to the thumbnail already in Storage.
+                send_pushover_notification(
+                    message=message,
+                    title=subject,
+                    image_path=full_image_path,
+                    priority=push_priority,
+                )
+
+                send_push_notification(
+                    message=message,
+                    title=subject,
+                    image_path=(storage or {}).get('thumb_path'),
+                    priority=push_priority,
                 )
 
                 # Clean up local files so the Pi disk doesn't fill up.
