@@ -59,13 +59,30 @@ def viewers():
     return _viewers
 
 
-def _encode_latest():
+def _encode_latest(quality=None, max_width=None):
+    """Encode the newest frame, optionally smaller and/or lossier.
+
+    A full-quality 640x480 frame is about 42KB, and the viewer polls a little
+    over three times a second -- roughly 8MB per minute, or 480MB an hour. That
+    is fine on wifi and expensive on cellular, so the client can ask for less.
+    Downscaling is done here rather than on the phone because the point is to
+    not send the bytes in the first place.
+    """
     with _lock:
         f = _frame
         s = _seq
     if f is None:
         return None, s
-    ok, buf = cv2.imencode('.jpg', f, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+
+    if max_width and f.shape[1] > max_width:
+        scale = max_width / float(f.shape[1])
+        # INTER_AREA is the right filter for shrinking; the default bilinear
+        # aliases badly and the artefacts cost bytes back in the JPEG.
+        f = cv2.resize(f, (max_width, int(f.shape[0] * scale)),
+                       interpolation=cv2.INTER_AREA)
+
+    q = JPEG_QUALITY if quality is None else max(20, min(95, quality))
+    ok, buf = cv2.imencode('.jpg', f, [int(cv2.IMWRITE_JPEG_QUALITY), q])
     if not ok:
         return None, s
     return buf.tobytes(), s
@@ -97,7 +114,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         global _viewers
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
 
         if path == '/health':
             body = b'{"ok":true}'
@@ -114,7 +133,35 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if path == '/snapshot.jpg':
-            data, _ = _encode_latest()
+            def _int_param(name, lo, hi):
+                try:
+                    v = int((query.get(name) or [''])[0])
+                except (TypeError, ValueError):
+                    return None
+                return max(lo, min(hi, v))
+
+            # since=<seq> lets a polling client skip a frame it already has.
+            # The viewer polls faster than the detector produces frames, so
+            # without this a good fraction of requests re-send identical bytes.
+            try:
+                since = int((query.get('since') or [''])[0])
+            except (TypeError, ValueError):
+                since = None
+
+            with _lock:
+                current_seq = _seq
+            if since is not None and since == current_seq:
+                self.send_response(304)
+                self.send_header('X-Frame-Seq', str(current_seq))
+                self.send_header('Content-Length', '0')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                return
+
+            data, seq = _encode_latest(
+                quality=_int_param('q', 20, 95),
+                max_width=_int_param('w', 160, 1920),
+            )
             if data is None:
                 self.send_response(503)
                 self.send_header('Content-Length', '0')
@@ -124,6 +171,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header('Content-Type', 'image/jpeg')
             self.send_header('Content-Length', str(len(data)))
+            self.send_header('X-Frame-Seq', str(seq))
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
             self.send_header('Connection', 'close')
             self.end_headers()
