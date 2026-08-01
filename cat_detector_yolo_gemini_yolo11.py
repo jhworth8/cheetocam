@@ -16,7 +16,6 @@ import io
 import hashlib
 import logging
 import PIL.Image
-import google.generativeai as genai
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from ultralytics import YOLO
@@ -25,8 +24,6 @@ from caption_logic import (
     ANIMAL_CLASSES,
     should_suppress,
     resolve_reported_classes,
-    build_confirmation_prompt,
-    parse_gemini_confirmation,
 )
 # Module level, NOT inside the ENABLE_CHEETO_ID block below: the caption crop
 # needs this whether or not prototype ID is switched on. cheeto_id only pulls
@@ -65,7 +62,6 @@ SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
 ENV_PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
 ENV_EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
 ENV_BOTHER_EMAIL = os.getenv('BOTHER_EMAIL', '').strip()
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 
 # Two notification paths run in parallel.
@@ -87,12 +83,6 @@ PUSH_DISPATCH_URL = os.getenv('PUSH_DISPATCH_URL', 'http://192.168.86.113:8090/p
 PUSH_DISPATCH_TOKEN = os.getenv('PUSH_DISPATCH_TOKEN', '')
 ENABLE_DISPATCH_PUSH = int(os.getenv('ENABLE_DISPATCH_PUSH', '1'))
 
-ENABLE_GEMINI = int(os.getenv('ENABLE_GEMINI', '1'))
-# Gemini cloud fallback for captions is OFF by default — the system is
-# local-AI-only (Florence-2). When Florence is unavailable or times out we
-# simply proceed without a caption (label hedged to 'cat') rather than
-# reaching out to Gemini. Set ENABLE_GEMINI_FALLBACK=1 to re-enable.
-ENABLE_GEMINI_FALLBACK = int(os.getenv('ENABLE_GEMINI_FALLBACK', '0'))
 ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_SUPABASE_UPLOAD = int(os.getenv('ENABLE_SUPABASE_UPLOAD', '1'))
 
@@ -145,13 +135,13 @@ FLORENCE_TASK = os.getenv('FLORENCE_TASK', '<DETAILED_CAPTION>')
 FLORENCE_MAX_NEW_TOKENS = int(os.getenv('FLORENCE_MAX_NEW_TOKENS', '128'))
 FLORENCE_NUM_BEAMS = int(os.getenv('FLORENCE_NUM_BEAMS', '1'))  # 1 = greedy (fastest)
 # Extra grace period to wait for Florence after the GIF burst finishes.
-# If it hasn't returned by then, fall back to Gemini.
+# If it has not returned by then, proceed without an activity description.
 FLORENCE_GRACE_AFTER_GIF = float(os.getenv('FLORENCE_GRACE_AFTER_GIF', '30'))
 # How long to wait for Florence when the GIF burst is SKIPPED. The burst is
 # what normally gives Florence its headroom: ~25s of capture plus the grace
 # above, ~55s total. Drop the burst and the grace alone is the whole budget —
 # and measured caption times are 27-33s, so a bare 30s would start timing out
-# and falling back to Gemini. Keep the total roughly the same.
+# and losing the local description. Keep the total roughly the same.
 FLORENCE_TIMEOUT_NO_GIF = float(os.getenv('FLORENCE_TIMEOUT_NO_GIF', '55'))
 # Crop the frame around the animal before captioning. Florence was being
 # handed the whole 640x480 porch, where the cat is a small fraction of the
@@ -186,10 +176,6 @@ LEARNED_PROFILE_CACHE_PATH = os.getenv(
 # GIF frames are 5s later so they're always settled.
 POST_DETECTION_SETTLE_FRAMES = int(os.getenv('POST_DETECTION_SETTLE_FRAMES', '10'))
 
-# Initialize Gemini API if enabled
-if ENABLE_GEMINI:
-    genai.configure(api_key=GEMINI_API_KEY)
-
 # Initialize Supabase client
 SUPABASE_URL = os.getenv('SUPABASE_URL', '')
 SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
@@ -207,7 +193,6 @@ _settings_cache = {
         'phone_recipients': ENV_PHONE_RECIPIENTS,
         'bother_email': ENV_BOTHER_EMAIL,
         'cooldown_seconds': COOLDOWN_DURATION,
-        'use_local_ai': True,
         # Preserve today's behaviour unless the owner explicitly chooses the
         # visit-aware notification mode in a newer client.
         'alert_mode': 'every_detection',
@@ -237,9 +222,6 @@ def get_notification_settings():
                 cooldown = COOLDOWN_DURATION
             # Clamp to a sane range so a bad dashboard value can't break things.
             cooldown = max(10, min(cooldown, 3600))
-            use_local_ai = row.get('use_local_ai')
-            if use_local_ai is None:
-                use_local_ai = True
             _settings_cache['value'] = {
                 'email_enabled': bool(row.get('email_enabled', True)),
                 'pushover_enabled': bool(row.get('pushover_enabled', True)),
@@ -249,7 +231,6 @@ def get_notification_settings():
                 'phone_recipients': phone_recipients if phone_recipients else ENV_PHONE_RECIPIENTS,
                 'bother_email': bother_email if bother_email else ENV_BOTHER_EMAIL,
                 'cooldown_seconds': cooldown,
-                'use_local_ai': bool(use_local_ai),
                 'alert_mode': row.get('alert_mode') or 'every_detection',
                 'notification_title_style': row.get('notification_title_style') or 'smart',
                 'notification_include_photo': bool(row.get('notification_include_photo', True)),
@@ -514,19 +495,6 @@ def send_push_notification(message, title="Detection Alert", image_path=None, pr
     except Exception as e:
         logging.error("Error dispatching push notification: %s", e)
 
-def get_gemini_response(image_path, prompt):
-    if not ENABLE_GEMINI:
-        return ""
-    try:
-        sample_file = PIL.Image.open(image_path)
-        model = genai.GenerativeModel(model_name="gemini-3.1-flash-lite")
-        response = model.generate_content([prompt, sample_file])
-        logging.info("Gemini response received.")
-        return response.text
-    except Exception as e:
-        logging.error(f"Gemini error: {e}")
-        return "Could not generate description."
-
 # Florence-2 model + processor are loaded lazily on first use (or eagerly
 # via load_florence_blocking() at startup) and kept resident for the
 # lifetime of the process. Loading takes ~5-10s after model files are
@@ -672,45 +640,27 @@ class _CaptionThread(threading.Thread):
         else:
             logging.info(f"Florence-2 call finished in {elapsed:.1f}s with no usable result.")
 
-def _call_gemini_for_description(image_path, detected_classes):
-    """Ask Gemini to confirm an animal is present AND describe it, via the
-    structured VISIBLE/DESCRIPTION prompt. Returns (description, says_absent).
-    says_absent is True only when Gemini explicitly reports no animal — API
-    failures return ("", False) so an outage alone never suppresses an alert."""
-    resp = get_gemini_response(image_path, build_confirmation_prompt(detected_classes))
-    if not resp or resp == "Could not generate description.":
-        return "", False
-    confirmed, description = parse_gemini_confirmation(resp, detected_classes)
-    return description.strip(), (not confirmed)
-
 def resolve_caption(thread, image_path, detected_classes, grace=None):
-    """Wait for the Florence-2 thread (with a grace period after GIF capture),
-    then fall back to Gemini if Florence returned nothing OR if the user has
-    disabled local AI via the dashboard. Returns (description, source,
-    vlm_says_absent). vlm_says_absent is True when Gemini's structured
-    confirmation explicitly said no animal is visible.
-    Florence-2 doesn't generate a title — the caller uses a generic subject."""
-    # thread is None when local AI is disabled or Florence failed to load.
+    """Wait for the local Florence-2 thread after GIF capture.
+
+    If local captioning produces nothing, detection continues with no activity
+    description. YOLO's multi-frame confirmation and CLIP pet recognition are
+    independent of captioning, so a local-model failure never becomes a cloud
+    call and never silently drops a real visitor.
+    """
+    # thread is None only when Florence is intentionally disabled for recovery.
     if thread is None:
-        if ENABLE_GEMINI_FALLBACK:
-            logging.info("Local AI disabled — using Gemini for description.")
-            text, absent = _call_gemini_for_description(image_path, detected_classes)
-            return text, ("gemini" if text else "none"), absent
-        logging.info("Local AI disabled and Gemini fallback off — no caption; label will hedge to cat.")
+        logging.info("Local captioning unavailable — continuing without a description.")
         return "", "none", False
 
     thread.join(timeout=FLORENCE_GRACE_AFTER_GIF if grace is None else grace)
     if thread.description:
         return thread.description, "florence", False
-    if ENABLE_GEMINI_FALLBACK:
-        logging.info("Florence-2 didn't return in time — falling back to Gemini.")
-        text, absent = _call_gemini_for_description(image_path, detected_classes)
-        return text, ("gemini" if text else "none"), absent
-    logging.info("Florence-2 returned nothing and Gemini fallback off — no caption; label will hedge to cat.")
+    logging.info("Florence-2 returned nothing — continuing without a description.")
     return "", "none", False
 
 def upload_detection_to_supabase(
-        timestamp, gemini_response, main_image_path, detected_classes=None,
+        timestamp, caption, main_image_path, detected_classes=None,
         detectionTemp=None, detectionWeather=None, detectionIcon=None,
         captured_epoch=None, identity_label=None, identity_confidence=None,
         identity_source=None, animal_id=None, bbox=None, needs_review=False,
@@ -763,7 +713,9 @@ def upload_detection_to_supabase(
             # `epoch` remains the user-facing moment for old clients. It is the
             # capture instant now, not the time Florence happened to finish.
             'epoch': int(captured_epoch or processed_epoch),
-            'gemini_response': gemini_response,
+            # Historical database column name; values are now generated only
+            # by the local Florence model (or left blank).
+            'gemini_response': caption,
             'image_path': image_path,
             'thumb_path': thumb_path,
             'detectiontemp': detectionTemp,
@@ -951,8 +903,8 @@ except Exception as _exc:
 load_florence_blocking()
 
 # Load the Cheeto prototype. A missing file is not an error — it just means
-# the prototype hasn't been trained yet and species ID falls back to the
-# caption, exactly as the detector behaved before.
+# the prototype has not been trained yet and species labeling uses the local
+# caption plus conservative uncertainty rules.
 _CHEETO_PROTOTYPE = None
 identify_cheeto = None
 if ENABLE_CHEETO_ID:
@@ -1353,10 +1305,9 @@ try:
                 full_image_path = f'detection_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
 
-                # Kick off caption generation in parallel with the GIF burst
-                # — but only if the user has local AI enabled. Otherwise we'd
-                # waste 30+s of CPU on a Florence-2 inference we'd throw away
-                # in favor of Gemini.
+                # Kick off local caption generation in parallel with the GIF
+                # burst, using the settled animal crop. Activity text never
+                # leaves the Pi for processing.
                 # One YOLO pass on the settled frame, shared by the caption
                 # crop and the prototype. Re-run rather than reuse the trigger
                 # frame's box: this frame is POST_DETECTION_SETTLE_FRAMES
@@ -1453,8 +1404,7 @@ try:
                         pushed = True
                     logging.info("Fast-path known-visitor alert completed before captioning.")
 
-                use_local = early_settings.get('use_local_ai', True)
-                if use_local:
+                if ENABLE_FLORENCE:
                     caption_image = crop_for_caption(
                         PIL.Image.open(full_image_path).convert('RGB'),
                         animal_bbox)
@@ -1484,10 +1434,10 @@ try:
                         "goes out by email)."
                     )
 
-                # Wait for Florence-2, then fall back to Gemini if it hasn't
-                # returned. Without the burst there's no 25s of incidental
-                # headroom, so extend the wait to keep the total budget the
-                # same — otherwise a normal 33s caption starts timing out.
+                # Wait only for local Florence-2. Without the burst there is no
+                # 25s of incidental headroom, so extend the wait to keep the
+                # total budget the same. If it still has no result, the visit
+                # is saved and alerted without an activity description.
                 description, caption_source, vlm_says_absent = resolve_caption(
                     caption_thread, full_image_path, detected_classes,
                     grace=None if gif_path else FLORENCE_TIMEOUT_NO_GIF)
@@ -1497,8 +1447,8 @@ try:
                 )
 
                 # False-positive filter: skip everything (notification +
-                # Supabase upload) when Gemini explicitly said no animal is
-                # visible, or the caption describes an animal-free scene.
+                # upload) only when the local caption describes an
+                # animal-free scene.
                 # Catches YOLO hallucinating a "dog" from shadows or the
                 # doormat pattern.
                 if (not known_name and

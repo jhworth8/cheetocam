@@ -9,7 +9,6 @@ from caption_logic import (
     looks_like_false_positive,
     should_suppress,
     resolve_reported_classes,
-    parse_gemini_confirmation,
 )
 
 
@@ -78,13 +77,6 @@ def test_speculative_species_with_confirmed_nonmatch_is_reported():
     assert hedged
 
 
-def test_speculative_species_from_gemini_is_not_hedged():
-    caption = "A fox standing on the porch steps."
-    reported, _, hedged = resolve_reported_classes(['bear'], caption, 'gemini')
-    assert reported == ['fox']
-    assert not hedged
-
-
 def test_cheeto_prototype_match_overrides_a_bad_caption():
     # The prototype is trained on THIS cat; a 230M captioner is not. When it
     # fires, nothing the caption claims about species should survive.
@@ -107,7 +99,7 @@ def test_not_cheeto_disables_the_small_critter_override():
     # Size contradiction says "that's the cat", but the prototype actively
     # disagreed — real evidence beats an inference about box size.
     reported, _, _ = resolve_reported_classes(
-        ['bear'], "A red squirrel on the railing.", 'gemini', 'not_cheeto')
+        ['bear'], "A red squirrel on the railing.", 'florence', 'not_cheeto')
     assert reported == ['squirrel']
 
 
@@ -182,36 +174,6 @@ def test_animals_in_caption_priority_and_wordboundaries():
     # 'category' must not match 'cat'; 'mat' must not match 'rat'.
     assert animals_in_caption("A category of doormats on the mat.") == []
     assert animals_in_caption("") == []
-
-
-def test_parse_confirmation_structured_yes():
-    text = "VISIBLE: yes\nDESCRIPTION: An orange tabby cat sitting by the door."
-    confirmed, desc = parse_gemini_confirmation(text, ['cow'])
-    assert confirmed
-    assert desc.startswith("An orange tabby")
-
-
-def test_parse_confirmation_structured_no():
-    text = "VISIBLE: no\nDESCRIPTION: An empty porch with a striped mat."
-    confirmed, desc = parse_gemini_confirmation(text, ['cat'])
-    assert not confirmed
-    assert 'empty porch' in desc.lower()
-
-
-def test_parse_confirmation_freeform_wrong_label_but_real_animal():
-    # Gemini ignores the format but names a cat while YOLO guessed cow —
-    # must count as confirmed, not suppressed.
-    text = "I can see a small cat sitting near the door."
-    confirmed, _ = parse_gemini_confirmation(text, ['cow'])
-    assert confirmed
-
-
-def test_parse_confirmation_freeform_negation():
-    confirmed, _ = parse_gemini_confirmation(
-        "I don't see any cat in this image.", ['cat'])
-    assert not confirmed
-
-
 if __name__ == '__main__':
     import sys
     failures = 0

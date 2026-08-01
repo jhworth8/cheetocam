@@ -22,7 +22,8 @@ ANIMAL_CLASSES = PLAUSIBLE_ANIMAL_CLASSES + LOOKALIKE_ANIMAL_CLASSES
 # on a dark porch frame an orange tabby is its favourite fox/squirrel. These
 # are still reported — a raccoon really does visit — but never asserted
 # flatly; the caller hedges the wording when the caption came from the local
-# model. Gemini is trusted to name them outright.
+# model, so they are always presented as uncertain unless pet recognition
+# independently identifies the visitor.
 SPECULATIVE_CAPTION_ANIMALS = [
     'raccoon', 'opossum', 'fox', 'skunk', 'squirrel', 'rabbit', 'deer',
 ]
@@ -143,8 +144,8 @@ def resolve_reported_classes(detected_classes, description, caption_source=None,
     caption naming a fine-grained wild species is treated as a guess, and a
     guess that contradicts the size of YOLO's box is overruled outright.
 
-    caption_source is 'florence' (weak local model), 'gemini' (trusted), or
-    None. cheeto_verdict is 'cheeto' / 'not_cheeto' / 'unknown' / None from
+    caption_source is 'florence' (the local model) or None. cheeto_verdict is
+    'cheeto' / 'not_cheeto' / 'unknown' / None from
     cheeto_id.identify(). Returns (classes_to_report, note_or_None, hedged).
       note   — short transparency line for the notification body, or None.
                Deliberately never repeats YOLO's raw wrong label; that's
@@ -184,14 +185,15 @@ def resolve_reported_classes(detected_classes, description, caption_source=None,
         # A partial orange back or tail is exactly where Florence calls Cheeto
         # a fox/squirrel. When the identity model could not get a usable crop,
         # one weak caption must not invent a species. Save it as an unknown
-        # animal for the review/training flow instead. A confirmed non-match or
-        # Gemini's stronger structured confirmation may still name the visitor.
+        # animal for the review/training flow instead. A confirmed identity
+        # non-match may still name the visitor, but the local species guess is
+        # kept visibly uncertain.
         if (caption_source == 'florence'
                 and cheeto_verdict in (None, 'unknown')):
             return ['animal'], "(identity uncertain — saved for review)", True
 
         # A wild species with independent evidence that it is not Cheeto.
-        return caption_animals, None, caption_source != 'gemini'
+        return caption_animals, None, True
 
     plausible = [c for c in detected_unique if c in PLAUSIBLE_ANIMAL_CLASSES]
     if plausible:
@@ -203,64 +205,3 @@ def resolve_reported_classes(detected_classes, description, caption_source=None,
     if cheeto_verdict == 'not_cheeto':
         return ['cat'], "(unverified — may not be Cheeto)", True
     return ['cat'], "(unverified — no clear look at the animal)", False
-
-
-def build_confirmation_prompt(detected_classes):
-    """Structured prompt that returns a parseable VISIBLE/DESCRIPTION block.
-
-    Asks about ANY animal, not just the detector's guess — the detector often
-    mislabels the cat as cow/elephant/etc, and "is a cow visible? no" must
-    not suppress a real cat."""
-    classes_str = ", ".join(detected_classes)
-    return (
-        "An object detector on a porch camera thinks it saw an animal "
-        f"(its guess: {classes_str}), but it often mislabels animals.\n\n"
-        "Look at the image and respond in exactly this format with no extra "
-        "commentary:\n"
-        "VISIBLE: yes  (if ANY animal is visible; otherwise: no)\n"
-        "DESCRIPTION: One or two short sentences. If an animal is visible, "
-        "say what kind it is, describe it (color/markings), and what it's "
-        "doing (sitting, walking, eating, etc.). If not, briefly say what "
-        "the image actually shows."
-    )
-
-
-def parse_gemini_confirmation(response_text, detected_classes):
-    """Return (confirmed: bool, description: str).
-
-    Prefers the structured VISIBLE/DESCRIPTION block. Falls back to keyword
-    matching when Gemini returns free-form text.
-    """
-    if not response_text:
-        return False, ""
-    text = response_text.strip()
-    description = text
-
-    visible_match = re.search(r"VISIBLE\s*:\s*(yes|no)\b", text, re.IGNORECASE)
-    desc_match = re.search(r"DESCRIPTION\s*:\s*(.+)", text, re.IGNORECASE | re.DOTALL)
-    if desc_match:
-        description = desc_match.group(1).strip()
-
-    if visible_match:
-        return visible_match.group(1).lower() == "yes", description
-
-    # Fallback: free-form text — use the keyword/negation heuristic.
-    lowered = text.lower()
-    negation_patterns = [
-        r"\bdon'?t see\b",
-        r"\bdo not see\b",
-        r"\bcannot see\b",
-        r"\bcan'?t see\b",
-        r"\bis not visible\b",
-        r"\bnot visible\b",
-    ]
-    if any(re.search(p, lowered) for p in negation_patterns):
-        return False, description
-    for cls in detected_classes:
-        if re.search(r'\b' + re.escape(cls.lower()) + r'\b', lowered):
-            return True, description
-    # YOLO's label may be wrong while the animal is real ("I see a cat", but
-    # the detector guessed cow) — any named animal counts as confirmation.
-    if animals_in_caption(lowered):
-        return True, description
-    return False, description
