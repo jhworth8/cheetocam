@@ -17,8 +17,9 @@ pip3 install numpy==2.1.3
 pip3 install pillow==11.0.0
 pip3 install requests==2.32.3
 pip3 install pytz==2024.2
-pip3 install google-generativeai==0.8.3
 pip3 install supabase==2.9.0
+pip3 install 'transformers>=4.49.0,<5'
+pip3 install 'open_clip_torch>=2.24.0'
 
 # Download YOLOv11n model (this will happen automatically on first run)
 echo "YOLOv11n model will be downloaded automatically on first run"
@@ -41,6 +42,6 @@ echo "sudo systemctl start cat-detector.service"
 
 echo "Installation complete!"
 echo "Next steps:"
-echo "1. Edit detector_config.py to configure your settings"
-echo "2. Run: python3 cat_detector_yolo_gemini_yolo11.py"
+echo "1. Copy .env.example to .env and configure your household"
+echo "2. Run: python3 critter_detector.py"
 echo "3. The YOLOv11n model will be downloaded automatically on first run"

@@ -21,6 +21,7 @@ its own exceptions; a broken stream must not stop the cat being watched.
 
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -60,6 +61,21 @@ def publish(frame):
 
 def viewers():
     return _viewers
+
+
+def ready():
+    """Whether the authenticated HTTP server is accepting connections."""
+    return _started
+
+
+def audio_available():
+    """Cheap capability check used by the detector heartbeat.
+
+    Opening ALSA here would briefly steal it from a live listener, so this
+    checks the encoder and device nodes. The endpoint still handles a device
+    disappearing without affecting video or detection.
+    """
+    return bool(_started and shutil.which('ffmpeg') and os.path.isdir('/dev/snd'))
 
 
 def _encode_latest(quality=None, max_width=None):

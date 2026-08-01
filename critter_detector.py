@@ -2,6 +2,7 @@
 import cv2
 import os
 import smtplib
+import subprocess
 from email.message import EmailMessage
 import re
 import time
@@ -85,6 +86,16 @@ ENABLE_DISPATCH_PUSH = int(os.getenv('ENABLE_DISPATCH_PUSH', '1'))
 
 ENABLE_CAT_DETECTION = int(os.getenv('ENABLE_CAT_DETECTION', '1'))
 ENABLE_SUPABASE_UPLOAD = int(os.getenv('ENABLE_SUPABASE_UPLOAD', '1'))
+
+# Every detector belongs to exactly one household. The original installation
+# keeps its stable default for a no-downtime upgrade; new installations receive
+# their household UUID during camera setup.
+DEFAULT_HOUSEHOLD_ID = '486f6c6c-696e-4773-8000-000000000001'
+HOUSEHOLD_ID = os.getenv('HOUSEHOLD_ID', DEFAULT_HOUSEHOLD_ID).strip()
+CAMERA_ID = os.getenv('CAMERA_ID', 'front-door').strip() or 'front-door'
+CAMERA_NAME = os.getenv('CAMERA_NAME', 'Front door').strip() or 'Front door'
+HEARTBEAT_SECONDS = max(15, int(os.getenv('HEARTBEAT_SECONDS', '30')))
+PROCESS_STARTED_EPOCH = int(time.time())
 
 # How often to re-fetch notification_settings from Supabase
 SETTINGS_REFRESH_SECONDS = int(os.getenv('SETTINGS_REFRESH_SECONDS', '30'))
@@ -181,6 +192,31 @@ SUPABASE_URL = os.getenv('SUPABASE_URL', '')
 SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
+_last_frame_epoch = None
+_last_detection_epoch = None
+_heartbeat_error = None
+_heartbeat_stop = threading.Event()
+
+
+def detector_version():
+    configured = os.getenv('DETECTOR_VERSION', '').strip()
+    if configured:
+        return configured
+    try:
+        return subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout.strip()
+    except Exception:
+        return 'unknown'
+
+
+DETECTOR_VERSION = detector_version()
+
 # Notification settings cache. Refreshed from Supabase every
 # SETTINGS_REFRESH_SECONDS so the dashboard can toggle channels remotely without
 # restarting the service.
@@ -208,7 +244,9 @@ def get_notification_settings():
     if now - _settings_cache['fetched_at'] < SETTINGS_REFRESH_SECONDS:
         return _settings_cache['value']
     try:
-        resp = supabase_client.table('notification_settings').select('*').eq('id', 1).limit(1).execute()
+        resp = (supabase_client.table('notification_settings').select('*')
+                .eq('household_id', HOUSEHOLD_ID).eq('id', 1)
+                .limit(1).execute())
         rows = resp.data or []
         if rows:
             row = rows[0]
@@ -683,8 +721,8 @@ def upload_detection_to_supabase(
         return None
     try:
         name = f"{timestamp}.jpg"
-        image_path = f"detections/{name}"
-        thumb_path = f"detections/thumb/{name}"
+        image_path = f"detections/{HOUSEHOLD_ID}/{name}"
+        thumb_path = f"detections/{HOUSEHOLD_ID}/thumb/{name}"
 
         with open(main_image_path, 'rb') as f:
             raw = f.read()
@@ -709,6 +747,7 @@ def upload_detection_to_supabase(
 
         processed_epoch = int(time.time())
         legacy_data = {
+            'household_id': HOUSEHOLD_ID,
             'timestamp': timestamp,
             # `epoch` remains the user-facing moment for old clients. It is the
             # capture instant now, not the time Florence happened to finish.
@@ -796,12 +835,12 @@ def update_detection_details(detection_id, description, temp, weather, icon,
         'needs_review': bool(needs_review),
     }
     try:
-        supabase_client.table('detections').update(rich).eq(
-            'id', detection_id).execute()
+        (supabase_client.table('detections').update(rich)
+         .eq('household_id', HOUSEHOLD_ID).eq('id', detection_id).execute())
     except Exception:
         try:
-            supabase_client.table('detections').update(legacy).eq(
-                'id', detection_id).execute()
+            (supabase_client.table('detections').update(legacy)
+             .eq('household_id', HOUSEHOLD_ID).eq('id', detection_id).execute())
         except Exception as exc:
             logging.error("Could not update slow detection details: %s", exc)
 
@@ -901,6 +940,61 @@ except Exception as _exc:
 # Block until Florence-2 is loaded — the detector should never alert without
 # the local VLM ready, per explicit configuration.
 load_florence_blocking()
+
+
+def send_camera_heartbeat(state=None, error_message=None):
+    """Publish a tiny liveness row without touching detection cadence."""
+    global _heartbeat_error
+    now = int(time.time())
+    local_ready = bool(ENABLE_FLORENCE and _FLORENCE_MODEL is not None)
+    live_ready = bool(live_stream is not None and live_stream.ready())
+    frame_fresh = bool(_last_frame_epoch and now - _last_frame_epoch <= 15)
+    resolved_state = state or (
+        'ready' if local_ready and live_ready and frame_fresh else 'degraded')
+    resolved_error = error_message or _heartbeat_error
+    payload = {
+        'household_id': HOUSEHOLD_ID,
+        'camera_id': CAMERA_ID,
+        'display_name': CAMERA_NAME,
+        'detector_version': DETECTOR_VERSION,
+        'state': resolved_state,
+        'process_started_epoch': PROCESS_STARTED_EPOCH,
+        'heartbeat_epoch': now,
+        'last_frame_epoch': _last_frame_epoch,
+        'last_detection_epoch': _last_detection_epoch,
+        'local_ai_ready': local_ready,
+        'live_ready': live_ready,
+        'audio_available': bool(
+            live_stream is not None and live_stream.audio_available()),
+        'error_message': resolved_error,
+        'metrics': {
+            'viewers': live_stream.viewers() if live_stream is not None else 0,
+            'model': FLORENCE_MODEL_ID if local_ready else None,
+        },
+        'updated_at': datetime.now(timezone('UTC')).isoformat(),
+    }
+    try:
+        (supabase_client.table('camera_status')
+         .upsert(payload, on_conflict='household_id,camera_id').execute())
+        _heartbeat_error = None
+        return True
+    except Exception as exc:
+        _heartbeat_error = str(exc).splitlines()[0][:240]
+        logging.warning("Camera heartbeat unavailable: %s", _heartbeat_error)
+        return False
+
+
+def heartbeat_loop():
+    while not _heartbeat_stop.is_set():
+        send_camera_heartbeat()
+        _heartbeat_stop.wait(HEARTBEAT_SECONDS)
+
+
+threading.Thread(
+    target=heartbeat_loop,
+    daemon=True,
+    name='camera-heartbeat',
+).start()
 
 # Load the Cheeto prototype. A missing file is not an error — it just means
 # the prototype has not been trained yet and species labeling uses the local
@@ -1032,7 +1126,10 @@ def get_learned_profiles(force=False):
             LEARNED_PROFILE_REFRESH_SECONDS):
         return _learned_profile_cache['profiles']
     try:
-        response = supabase_client.rpc('profile_training_samples').execute()
+        response = supabase_client.rpc(
+            'profile_training_samples',
+            {'p_household_id': HOUSEHOLD_ID},
+        ).execute()
         rows = getattr(response, 'data', None) or []
         signature_source = 'multi-exemplar-v3|' + '|'.join(
             f"{row['animal_id']}:{row['detection_id']}"
@@ -1258,7 +1355,10 @@ try:
         ret, frame = cap.read()
         if not ret:
             logging.error("Frame grab failed.")
+            _heartbeat_error = 'Camera frame grab failed'
             break
+
+        _last_frame_epoch = int(time.time())
 
         # Hand the frame to the live view. Stores a reference only — no copy and
         # no JPEG encode — so this costs effectively nothing when nobody is
@@ -1288,6 +1388,7 @@ try:
             elif detections:
                 detection_streak = 0
                 captured_epoch = int(current_time)
+                _last_detection_epoch = captured_epoch
                 detected_classes = [d['class'] for d in detections]
                 logging.info(f"Detected {len(detections)} objects: {detected_classes}")
 
@@ -1598,5 +1699,7 @@ except Exception as e:
     logging.error(f"Error occurred: {e}")
 
 finally:
+    _heartbeat_stop.set()
+    send_camera_heartbeat(state='error', error_message='Detector stopped')
     cap.release()
     logging.info("Camera released. Program terminated.")

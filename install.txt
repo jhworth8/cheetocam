@@ -1,4 +1,0 @@
-pip install opencv-python --break-system-packages
-pip install google-generativeai --break-system-packages
-pip install python-dotenv --break-system-packages
-pip install pytz --break-system-packages
