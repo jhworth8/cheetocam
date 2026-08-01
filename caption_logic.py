@@ -181,8 +181,17 @@ def resolve_reported_classes(detected_classes, description, caption_source=None,
                 and any(a in SMALL_CRITTERS for a in caption_animals)):
             return ['cat'], None, False
 
-        # A wild species the local model guessed at. Report it, but say so.
-        return caption_animals, None, caption_source == 'florence'
+        # A partial orange back or tail is exactly where Florence calls Cheeto
+        # a fox/squirrel. When the identity model could not get a usable crop,
+        # one weak caption must not invent a species. Save it as an unknown
+        # animal for the review/training flow instead. A confirmed non-match or
+        # Gemini's stronger structured confirmation may still name the visitor.
+        if (caption_source == 'florence'
+                and cheeto_verdict in (None, 'unknown')):
+            return ['animal'], "(identity uncertain — saved for review)", True
+
+        # A wild species with independent evidence that it is not Cheeto.
+        return caption_animals, None, caption_source != 'gemini'
 
     plausible = [c for c in detected_unique if c in PLAUSIBLE_ANIMAL_CLASSES]
     if plausible:

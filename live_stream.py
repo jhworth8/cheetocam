@@ -20,6 +20,8 @@ its own exceptions; a broken stream must not stop the cat being watched.
 """
 
 import logging
+import os
+import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +35,7 @@ _seq = 0               # bumped per frame so viewers can wait for a *new* one
 _viewers = 0           # live MJPEG connections
 _token = ''
 _started = False
+_audio_lock = threading.Lock()
 
 JPEG_QUALITY = 70
 IDLE_SLEEP = 0.04
@@ -132,6 +135,59 @@ class _Handler(BaseHTTPRequestHandler):
             self._deny()
             return
 
+        if path == '/audio.mp3':
+            if not _audio_lock.acquire(blocking=False):
+                body = b'audio already in use'
+                self.send_response(409)
+                self.send_header('Content-Type', 'text/plain')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            device = os.getenv('STREAM_AUDIO_DEVICE', 'plughw:CARD=B100,DEV=0')
+            command = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-f', 'alsa', '-i', device,
+                '-ac', '1', '-ar', '16000', '-b:a', '32k',
+                '-f', 'mp3', 'pipe:1',
+            ]
+            process = None
+            started = time.time()
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=0,
+                )
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/mpeg')
+                self.send_header('Cache-Control', 'no-store, no-cache')
+                self.send_header('X-Accel-Buffering', 'no')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                while time.time() - started < MAX_STREAM_SECONDS:
+                    chunk = process.stdout.read(4096)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                logging.warning("Live audio ended: %s", exc)
+            finally:
+                if process is not None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                _audio_lock.release()
+            return
+
         if path == '/snapshot.jpg':
             def _int_param(name, lo, hi):
                 try:
@@ -154,7 +210,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_response(304)
                 self.send_header('X-Frame-Seq', str(current_seq))
                 self.send_header('Content-Length', '0')
-                self.send_header('Connection', 'close')
+                # Keep the TLS/proxy connection reusable. The Flutter viewer
+                # polls several times per second through Cloudflare; forcing a
+                # new connection for every unchanged frame was a large and
+                # intermittent part of live-start latency.
+                self.send_header('Connection', 'keep-alive')
                 self.end_headers()
                 return
 
@@ -173,7 +233,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(data)))
             self.send_header('X-Frame-Seq', str(seq))
             self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
-            self.send_header('Connection', 'close')
+            self.send_header('Connection', 'keep-alive')
             self.end_headers()
             self.wfile.write(data)
             return
@@ -241,7 +301,10 @@ def start(port=8088, token=''):
         threading.Thread(target=server.serve_forever, daemon=True,
                          name='live-stream').start()
         _started = True
-        logging.info("Live view serving on :%d (/stream.mjpg, /snapshot.jpg).", port)
+        logging.info(
+            "Live view serving on :%d (/stream.mjpg, /snapshot.jpg, /audio.mp3).",
+            port,
+        )
         return True
     except Exception as exc:
         # A port clash or permission problem must not stop detection.

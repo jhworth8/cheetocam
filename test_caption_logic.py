@@ -58,11 +58,22 @@ def test_real_squirrel_with_plausible_yolo_label_is_reported():
     assert reported == ['squirrel']
 
 
-def test_speculative_species_from_florence_is_hedged():
-    # Fox is cat-sized, so there's no size contradiction to overrule it — but
-    # Florence-2-base guesses wild species, so don't assert it.
+def test_speculative_species_from_florence_becomes_reviewable_animal():
+    # Production frames showed that an orange back/tail is repeatedly called a
+    # fox. With no usable identity evidence, do not turn one caption into a
+    # species claim; route it to the visitor review flow.
     caption = "A fox standing on the porch steps."
-    reported, _, hedged = resolve_reported_classes(['bear'], caption, 'florence')
+    reported, note, hedged = resolve_reported_classes(
+        ['bear'], caption, 'florence', 'unknown')
+    assert reported == ['animal']
+    assert note and 'review' in note
+    assert hedged
+
+
+def test_speculative_species_with_confirmed_nonmatch_is_reported():
+    caption = "A fox standing on the porch steps."
+    reported, _, hedged = resolve_reported_classes(
+        ['bear'], caption, 'florence', 'not_cheeto')
     assert reported == ['fox']
     assert hedged
 
@@ -108,17 +119,11 @@ def test_not_cheeto_with_no_caption_is_flagged_uncertain():
     assert hedged
 
 
-def test_unknown_verdict_behaves_exactly_like_no_prototype():
-    # Untrained or failed ID must not change any existing decision.
-    cases = [
-        (['bear'], "A red squirrel on the porch.", 'florence'),
-        (['cow'], "An orange cat by the door.", 'florence'),
-        (['elephant'], "", None),
-        (['cat'], "A gray tabby cat on the mat.", 'gemini'),
-    ]
-    for classes, caption, source in cases:
-        assert (resolve_reported_classes(classes, caption, source, 'unknown')
-                == resolve_reported_classes(classes, caption, source, None))
+def test_unknown_verdict_keeps_confident_species_but_not_weak_wild_guess():
+    assert resolve_reported_classes(
+        ['cow'], "An orange cat by the door.", 'florence', 'unknown')[0] == ['cat']
+    assert resolve_reported_classes(
+        ['cat'], "A red fox on the porch.", 'florence', 'unknown')[0] == ['animal']
 
 
 def test_confident_species_beats_speculative_in_same_caption():

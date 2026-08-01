@@ -220,3 +220,65 @@ def identify(image, bbox, prototype, num_threads=None):
     except Exception as e:
         logging.error(f"Cheeto identification failed: {e}")
         return 'unknown', 0.0
+
+
+def match_learned_profiles(image, bbox, profiles, threshold=0.90,
+                           min_margin=0.015, num_threads=None):
+    """Conservatively match a crop against owner-reviewed visitor profiles.
+
+    The best score must clear an absolute threshold and beat the runner-up by
+    ``min_margin``. Similar-looking animals therefore remain unknown instead
+    of being confidently swapped. Returns ``(profile, score, margin)`` where
+    profile is ``None`` for every uncertain or error path.
+    """
+    if not profiles:
+        return None, 0.0, 0.0
+    try:
+        if isinstance(image, str):
+            image = PIL.Image.open(image)
+        first = profiles[0]
+        crop = crop_animal(image, bbox, first.get('pad_frac', DEFAULT_PAD_FRAC))
+        if crop is None:
+            return None, 0.0, 0.0
+        vec = embed_images(
+            [crop],
+            model_name=first.get('model_name', 'ViT-B-32-quickgelu'),
+            pretrained=first.get('pretrained', 'openai'),
+            num_threads=num_threads,
+        )
+        if vec.shape[0] == 0:
+            return None, 0.0, 0.0
+
+        def profile_score(profile):
+            """Blend the stable centroid with the best matching viewpoints.
+
+            A single average erases the differences between two similar orange
+            cats. Reviewed side/front/back exemplars keep those details, while
+            averaging the best two prevents one bad historical crop from
+            winning by itself.
+            """
+            centroid = float(np.dot(vec[0], profile['prototype']))
+            exemplars = profile.get('exemplars')
+            if exemplars is None or len(exemplars) == 0:
+                return centroid
+            exemplar_scores = np.sort(
+                np.asarray(exemplars, dtype=np.float32) @ vec[0]
+            )[::-1]
+            viewpoint = float(np.mean(exemplar_scores[:min(2, len(exemplar_scores))]))
+            return 0.60 * centroid + 0.40 * viewpoint
+
+        scores = np.asarray([
+            profile_score(p) for p in profiles
+        ], dtype=np.float32)
+        order = np.argsort(scores)[::-1]
+        best_i = int(order[0])
+        best_score = float(scores[best_i])
+        second = float(scores[int(order[1])]) if len(order) > 1 else 0.0
+        margin = best_score - second
+        required = float(profiles[best_i].get('threshold', threshold))
+        if best_score < required or (len(order) > 1 and margin < min_margin):
+            return None, best_score, margin
+        return profiles[best_i], best_score, margin
+    except Exception as e:
+        logging.error(f"Learned visitor identification failed: {e}")
+        return None, 0.0, 0.0

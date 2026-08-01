@@ -13,6 +13,7 @@ import numpy as np
 import requests
 import base64
 import io
+import hashlib
 import logging
 import PIL.Image
 import google.generativeai as genai
@@ -175,6 +176,11 @@ ENABLE_CHEETO_ID = int(os.getenv('ENABLE_CHEETO_ID', '1'))
 # CLIP shares the Pi's 4 cores with Florence. Leave one free so a detection
 # doesn't starve the capture loop and drop frames.
 CHEETO_ID_THREADS = int(os.getenv('CHEETO_ID_THREADS', '3'))
+LEARNED_PROFILE_REFRESH_SECONDS = int(os.getenv('LEARNED_PROFILE_REFRESH_SECONDS', '300'))
+LEARNED_PROFILE_THRESHOLD = float(os.getenv('LEARNED_PROFILE_THRESHOLD', '0.90'))
+LEARNED_PROFILE_MIN_MARGIN = float(os.getenv('LEARNED_PROFILE_MIN_MARGIN', '0.015'))
+LEARNED_PROFILE_CACHE_PATH = os.getenv(
+    'LEARNED_PROFILE_CACHE_PATH', 'learned_profiles.npz')
 # Drain this many frames immediately after a YOLO hit before saving the
 # "detection frame", so USB auto-exposure has a moment to settle. Subsequent
 # GIF frames are 5s later so they're always settled.
@@ -202,6 +208,13 @@ _settings_cache = {
         'bother_email': ENV_BOTHER_EMAIL,
         'cooldown_seconds': COOLDOWN_DURATION,
         'use_local_ai': True,
+        # Preserve today's behaviour unless the owner explicitly chooses the
+        # visit-aware notification mode in a newer client.
+        'alert_mode': 'every_detection',
+        'notification_title_style': 'smart',
+        'notification_include_photo': True,
+        'notification_include_activity': True,
+        'notification_include_weather': True,
     },
 }
 
@@ -237,6 +250,11 @@ def get_notification_settings():
                 'bother_email': bother_email if bother_email else ENV_BOTHER_EMAIL,
                 'cooldown_seconds': cooldown,
                 'use_local_ai': bool(use_local_ai),
+                'alert_mode': row.get('alert_mode') or 'every_detection',
+                'notification_title_style': row.get('notification_title_style') or 'smart',
+                'notification_include_photo': bool(row.get('notification_include_photo', True)),
+                'notification_include_activity': bool(row.get('notification_include_activity', True)),
+                'notification_include_weather': bool(row.get('notification_include_weather', True)),
             }
     except Exception as e:
         logging.error(f"Failed to fetch notification_settings, using last known values: {e}")
@@ -691,7 +709,12 @@ def resolve_caption(thread, image_path, detected_classes, grace=None):
     logging.info("Florence-2 returned nothing and Gemini fallback off — no caption; label will hedge to cat.")
     return "", "none", False
 
-def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, detected_classes=None, detectionTemp=None, detectionWeather=None, detectionIcon=None):
+def upload_detection_to_supabase(
+        timestamp, gemini_response, main_image_path, detected_classes=None,
+        detectionTemp=None, detectionWeather=None, detectionIcon=None,
+        captured_epoch=None, identity_label=None, identity_confidence=None,
+        identity_source=None, animal_id=None, bbox=None, needs_review=False,
+        frame_quality=None):
     """Insert the detection row and put the image in Supabase Storage.
 
     Images used to be base64 stuffed into the row (~220KB of text each), which
@@ -734,9 +757,12 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
                 raise RuntimeError(
                     f"storage upload {path} failed: {r.status_code} {r.text[:160]}")
 
-        detection_data = {
+        processed_epoch = int(time.time())
+        legacy_data = {
             'timestamp': timestamp,
-            'epoch': int(time.time()),
+            # `epoch` remains the user-facing moment for old clients. It is the
+            # capture instant now, not the time Florence happened to finish.
+            'epoch': int(captured_epoch or processed_epoch),
             'gemini_response': gemini_response,
             'image_path': image_path,
             'thumb_path': thumb_path,
@@ -744,14 +770,99 @@ def upload_detection_to_supabase(timestamp, gemini_response, main_image_path, de
             'detectionweather': detectionWeather,
             'detectionicon': detectionIcon
         }
-        response = supabase_client.table("detections").insert(detection_data).execute()
+        rich_data = {
+            **legacy_data,
+            'captured_epoch': int(captured_epoch or processed_epoch),
+            'processed_epoch': processed_epoch,
+            'identity_label': identity_label,
+            'identity_confidence': identity_confidence,
+            'identity_source': identity_source,
+            'animal_id': animal_id,
+            'raw_classes': detected_classes or [],
+            'model_version': 'yolo11n+clip+florence2-base',
+            'bbox': bbox,
+            'frame_quality': frame_quality,
+            'needs_review': bool(needs_review),
+        }
+        try:
+            response = supabase_client.table("detections").insert(rich_data).execute()
+        except Exception as exc:
+            # Deployment is deliberately rolling: the detector may update a
+            # few minutes before the database migration. Keep recording rows
+            # using the legacy contract instead of losing detections.
+            logging.warning("Visit columns unavailable; using legacy insert: %s", exc)
+            response = supabase_client.table("detections").insert(legacy_data).execute()
         inserted = len(getattr(response, 'data', None) or [])
+        inserted_row = (getattr(response, 'data', None) or [{}])[0]
+        visit_data = {}
+        detection_id = inserted_row.get('id')
+        if detection_id:
+            try:
+                visit_resp = supabase_client.rpc(
+                    'attach_detection_to_visit',
+                    {'p_detection_id': detection_id},
+                ).execute()
+                visit_data = getattr(visit_resp, 'data', None) or {}
+            except Exception as exc:
+                logging.warning("Visit attachment unavailable: %s", exc)
         logging.info(
             f"Detection uploaded ({inserted} row, image + thumb in Storage as {name}).")
-        return {'image_path': image_path, 'thumb_path': thumb_path}
+        return {
+            'image_path': image_path,
+            'thumb_path': thumb_path,
+            'detection_id': detection_id,
+            **(visit_data if isinstance(visit_data, dict) else {}),
+        }
     except Exception as e:
         logging.error(f"Error uploading to Supabase: {e}")
         return None
+
+
+def update_detection_details(detection_id, description, temp, weather, icon,
+                             identity_label, identity_confidence,
+                             identity_source, needs_review):
+    """Patch slow-caption results onto a row that may already have alerted.
+
+    Confident Cheeto detections take the fast path so the photo reaches the
+    phone in seconds. Florence still adds useful activity text afterwards, but
+    it never causes a second notification.
+    """
+    if not detection_id:
+        return
+    legacy = {
+        'gemini_response': description,
+        'detectiontemp': temp,
+        'detectionweather': weather,
+        'detectionicon': icon,
+    }
+    rich = {
+        **legacy,
+        'processed_epoch': int(time.time()),
+        'identity_label': identity_label,
+        'identity_confidence': identity_confidence,
+        'identity_source': identity_source,
+        'needs_review': bool(needs_review),
+    }
+    try:
+        supabase_client.table('detections').update(rich).eq(
+            'id', detection_id).execute()
+    except Exception:
+        try:
+            supabase_client.table('detections').update(legacy).eq(
+                'id', detection_id).execute()
+        except Exception as exc:
+            logging.error("Could not update slow detection details: %s", exc)
+
+
+def should_alert_for_visit(settings, storage):
+    """Apply the optional visit notification mode.
+
+    `every_detection` is the default and exactly preserves the current cadence.
+    The visit-aware alternative exists but is inert until explicitly selected.
+    """
+    if settings.get('alert_mode', 'every_detection') != 'first_of_visit':
+        return True
+    return not storage or bool(storage.get('is_new_visit', True))
 
 def detect_objects_yolo11(frame):
     """Detect objects using YOLOv11."""
@@ -846,7 +957,13 @@ _CHEETO_PROTOTYPE = None
 identify_cheeto = None
 if ENABLE_CHEETO_ID:
     try:
-        from cheeto_id import load_prototype, identify as identify_cheeto
+        from cheeto_id import (
+            load_prototype,
+            identify as identify_cheeto,
+            crop_animal,
+            embed_images,
+            match_learned_profiles,
+        )
         _CHEETO_PROTOTYPE = load_prototype(CHEETO_PROTOTYPE_PATH)
         if _CHEETO_PROTOTYPE:
             logging.info(
@@ -863,6 +980,236 @@ if ENABLE_CHEETO_ID:
         logging.error(f"Cheeto ID unavailable: {e}")
 
 
+def load_learned_profile_cache(path=LEARNED_PROFILE_CACHE_PATH):
+    """Load derived review prototypes without pickle or model weights."""
+    if not path or not os.path.exists(path):
+        return [], None
+    try:
+        data = np.load(path, allow_pickle=False)
+        vectors = data['prototypes'].astype(np.float32)
+        exemplar_matrix = data['exemplars'] if 'exemplars' in data.files else None
+        exemplar_counts = (data['exemplar_counts']
+                           if 'exemplar_counts' in data.files else None)
+        profiles = []
+        for i in range(len(vectors)):
+            vector = vectors[i]
+            norm = np.linalg.norm(vector)
+            if not norm:
+                continue
+            profile = {
+                'animal_id': int(data['animal_ids'][i]),
+                'name': str(data['names'][i]),
+                'slug': str(data['slugs'][i]),
+                'species': str(data['species'][i]),
+                'prototype': vector / norm,
+                'threshold': float(data['thresholds'][i]),
+                'pad_frac': 0.15,
+                'model_name': 'ViT-B-32-quickgelu',
+                'pretrained': 'openai',
+                'n_images': int(data['image_counts'][i]),
+            }
+            if exemplar_matrix is not None and exemplar_counts is not None:
+                profile['exemplars'] = exemplar_matrix[
+                    i, :int(exemplar_counts[i])].astype(np.float32)
+            profiles.append(profile)
+        signature = str(data['sample_signature'])
+        logging.info("Loaded %d reviewed visitor profile(s) from %s.",
+                     len(profiles), path)
+        return profiles, signature
+    except Exception as exc:
+        logging.warning("Could not load reviewed visitor cache %s: %s",
+                        path, exc)
+        return [], None
+
+
+def save_learned_profile_cache(profiles, signature,
+                               path=LEARNED_PROFILE_CACHE_PATH):
+    if not profiles or not path:
+        return
+    temp_path = f"{path}.new"
+    try:
+        max_exemplars = max(len(p.get('exemplars', [])) for p in profiles)
+        embedding_size = len(profiles[0]['prototype'])
+        exemplar_matrix = np.zeros(
+            (len(profiles), max_exemplars, embedding_size), dtype=np.float32)
+        exemplar_counts = np.zeros(len(profiles), dtype=np.int32)
+        for i, profile in enumerate(profiles):
+            exemplars = np.asarray(profile.get('exemplars', []), dtype=np.float32)
+            exemplar_counts[i] = len(exemplars)
+            if len(exemplars):
+                exemplar_matrix[i, :len(exemplars)] = exemplars
+        with open(temp_path, 'wb') as handle:
+            np.savez(
+                handle,
+                prototypes=np.stack([p['prototype'] for p in profiles]),
+                animal_ids=np.asarray([p['animal_id'] for p in profiles]),
+                names=np.asarray([p['name'] for p in profiles]),
+                slugs=np.asarray([p['slug'] for p in profiles]),
+                species=np.asarray([p['species'] for p in profiles]),
+                thresholds=np.asarray([p['threshold'] for p in profiles]),
+                image_counts=np.asarray([p['n_images'] for p in profiles]),
+                exemplars=exemplar_matrix,
+                exemplar_counts=exemplar_counts,
+                sample_signature=np.asarray(signature),
+            )
+        os.replace(temp_path, path)
+    except Exception as exc:
+        logging.warning("Could not save reviewed visitor cache %s: %s",
+                        path, exc)
+
+
+_cached_profiles, _cached_signature = load_learned_profile_cache()
+_learned_profile_cache = {
+    'fetched_at': 0.0,
+    'profiles': _cached_profiles,
+    'signature': _cached_signature,
+}
+
+
+def get_learned_profiles(force=False):
+    """Build conservative local prototypes from owner-reviewed visit samples.
+
+    The database holds only sample references. Embeddings and prototypes stay
+    on the Pi, are refreshed periodically, and reuse the already-loaded CLIP
+    encoder. Profiles with fewer than three usable crops never participate.
+    """
+    if not ENABLE_CHEETO_ID or 'embed_images' not in globals():
+        return []
+    now = time.time()
+    if (not force and now - _learned_profile_cache['fetched_at'] <
+            LEARNED_PROFILE_REFRESH_SECONDS):
+        return _learned_profile_cache['profiles']
+    try:
+        response = supabase_client.rpc('profile_training_samples').execute()
+        rows = getattr(response, 'data', None) or []
+        signature_source = 'multi-exemplar-v3|' + '|'.join(
+            f"{row['animal_id']}:{row['detection_id']}"
+            for row in sorted(rows,
+                              key=lambda r: (r['animal_id'], r['detection_id']))
+        )
+        signature = hashlib.sha256(
+            signature_source.encode('utf-8')).hexdigest()
+        logging.info(
+            "Reviewed visitor sample signature: %s (%d rows; cache %s).",
+            signature[:10], len(rows),
+            str(_learned_profile_cache.get('signature') or '')[:10] or 'none')
+        if (_learned_profile_cache['profiles'] and
+                signature == _learned_profile_cache.get('signature')):
+            _learned_profile_cache['fetched_at'] = now
+            logging.info("Reviewed visitor profiles are current; reused cache.")
+            return _learned_profile_cache['profiles']
+
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row['animal_id'], {
+                'animal_id': row['animal_id'],
+                'name': row['animal_name'],
+                'slug': row['animal_slug'],
+                'species': row.get('animal_species') or 'animal',
+                'rows': [],
+            })['rows'].append(row)
+
+        profiles = []
+        for profile in grouped.values():
+            crops = []
+            for row in profile['rows'][:24]:
+                try:
+                    image_response = requests.get(
+                        f"{SUPABASE_URL}/storage/v1/object/public/{row['image_path']}",
+                        timeout=20,
+                    )
+                    image_response.raise_for_status()
+                    image = PIL.Image.open(io.BytesIO(image_response.content)).convert('RGB')
+                    bbox = row.get('bbox')
+                    if not bbox:
+                        # Legacy/reviewed rows predate stored boxes. Recover
+                        # the animal box locally from the full webcam frame so
+                        # tapping "This is Cheeto" produces a real embedding
+                        # instead of a sample the Pi silently throws away.
+                        bgr = np.asarray(image)[:, :, ::-1].copy()
+                        bbox = best_animal_bbox(bgr)
+                    crop = crop_animal(image, bbox)
+                    if crop is not None:
+                        crops.append(crop)
+                except Exception as exc:
+                    logging.warning("Could not load learning sample %s: %s",
+                                    row.get('detection_id'), exc)
+            # One usable owner-confirmed crop may participate at a very strict
+            # threshold. That is important for a brand-new visitor: excluding
+            # Rocky entirely leaves only Cheeto in the comparison set, which
+            # makes the classifier structurally incapable of choosing Rocky.
+            if len(crops) < 1:
+                continue
+            vectors = embed_images(
+                crops,
+                model_name='ViT-B-32-quickgelu',
+                pretrained='openai',
+                num_threads=CHEETO_ID_THREADS,
+            )
+            # Remove the least centroid-consistent crops before learning. One
+            # mislabeled empty mat must not drag Cheeto toward Rocky forever.
+            rough = vectors.mean(axis=0)
+            rough_norm = np.linalg.norm(rough)
+            if not rough_norm:
+                continue
+            rough /= rough_norm
+            consistency = vectors @ rough
+            keep_at_least = min(3, len(vectors))
+            keep_count = max(keep_at_least, int(np.ceil(len(vectors) * .80)))
+            kept = vectors[np.argsort(consistency)[-keep_count:]]
+            prototype = kept.mean(axis=0)
+            norm = np.linalg.norm(prototype)
+            if not norm:
+                continue
+            prototype = (prototype / norm).astype(np.float32)
+
+            # Keep several genuinely different reviewed viewpoints. Start with
+            # the most representative crop, then greedily choose the crop least
+            # like the exemplars already kept.
+            exemplar_indices = [int(np.argmax(kept @ prototype))]
+            while len(exemplar_indices) < min(6, len(kept)):
+                chosen = kept[exemplar_indices]
+                redundancy = kept @ chosen.T
+                candidate_order = np.argsort(np.max(redundancy, axis=1))
+                next_index = next(
+                    (int(i) for i in candidate_order if int(i) not in exemplar_indices),
+                    None,
+                )
+                if next_index is None:
+                    break
+                exemplar_indices.append(next_index)
+
+            profiles.append({
+                'animal_id': profile['animal_id'],
+                'name': profile['name'],
+                'slug': profile['slug'],
+                'species': profile['species'],
+                'prototype': prototype,
+                'exemplars': kept[exemplar_indices].astype(np.float32),
+                'threshold': (max(LEARNED_PROFILE_THRESHOLD, .95)
+                              if len(crops) < 2 else
+                              (max(LEARNED_PROFILE_THRESHOLD, .925)
+                               if len(crops) < 3
+                               else LEARNED_PROFILE_THRESHOLD)),
+                'pad_frac': 0.15,
+                'model_name': 'ViT-B-32-quickgelu',
+                'pretrained': 'openai',
+                'n_images': len(crops),
+            })
+        _learned_profile_cache.update(
+            fetched_at=now, profiles=profiles, signature=signature)
+        save_learned_profile_cache(profiles, signature)
+        logging.info("Learned visitor library refreshed: %d ready profile(s).",
+                     len(profiles))
+        return profiles
+    except Exception as exc:
+        # A rolling database deployment or temporary API error must not erase a
+        # working in-memory library.
+        logging.warning("Could not refresh learned visitor library: %s", exc)
+        _learned_profile_cache['fetched_at'] = now
+        return _learned_profile_cache['profiles']
+
+
 def best_animal_bbox(frame):
     """Highest-confidence animal box in a frame, or None. Re-runs YOLO rather
     than reusing the trigger frame's box: the saved frame is captured
@@ -875,6 +1222,78 @@ def best_animal_bbox(frame):
     except Exception as e:
         logging.error(f"Bounding box lookup failed: {e}")
     return None
+
+
+def score_detection_frame(frame, bbox):
+    """Fast 0..1 portrait quality used by the visit thumbnail selector."""
+    if bbox is None or frame is None:
+        return 0.0
+    try:
+        height, width = frame.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        area_fraction = max(0, x2 - x1) * max(0, y2 - y1) / max(1, width * height)
+        crop = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
+        if crop.size == 0:
+            return 0.0
+        sharpness = cv2.Laplacian(
+            cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_64F
+        ).var()
+        cx = (x1 + x2) / 2 / max(1, width)
+        cy = (y1 + y2) / 2 / max(1, height)
+        centrality = max(0.0, 1.0 - np.hypot(cx - .5, cy - .45) / .75)
+        return float(np.clip(
+            .55 * min(1.0, area_fraction / .28) +
+            .25 * min(1.0, sharpness / 350.0) +
+            .20 * centrality,
+            0.0, 1.0,
+        ))
+    except Exception as exc:
+        logging.debug("Could not score detection frame: %s", exc)
+        return 0.0
+
+
+def build_notification(reported_classes, hedged, correction_note, description,
+                       temp, weather, captured_epoch, known_name=None,
+                       settings=None):
+    """Build user-facing copy from a stable identity decision.
+
+    The time is when the webcam captured the frame, not when a slow caption
+    finished. Cheeto gets his name; an uncertain weak-model species stays the
+    deliberately generic "animal" until the owner labels the visit.
+    """
+    captured = datetime.fromtimestamp(captured_epoch, timezone('US/Eastern'))
+    time_str = captured.strftime('%-I:%M %p ET')
+    settings = settings or {}
+    title_style = settings.get('notification_title_style', 'smart')
+    if title_style == 'generic':
+        subject = "Animal at the door 🐾"
+    elif title_style == 'name_only':
+        subject = f"{known_name or 'Animal'} at the door 🐾"
+    elif known_name:
+        subject = f"{known_name} at the door 🐾"
+    elif len(reported_classes) == 1:
+        label = reported_classes[0]
+        subject = (f"Possible {label} at the door 🐾" if hedged
+                   else f"{label.title()} at the door 🐾")
+    else:
+        joined = ', '.join(reported_classes)
+        subject = (f"Possibly spotted: {joined} 🐾" if hedged
+                   else f"Spotted: {joined} 🐾")
+
+    body_lines = [f"{time_str} · {', '.join(reported_classes)}"]
+    if correction_note:
+        body_lines.append(correction_note)
+    if description and settings.get('notification_include_activity', True):
+        body_lines.extend(("", description))
+    if (temp is not None and weather and
+            settings.get('notification_include_weather', True)):
+        body_lines.extend(("", f"Weather: {temp:.0f}°F, {weather}"))
+    return subject, "\n".join(body_lines)
+
+# Warm a changed review library once at startup. Subsequent five-minute checks
+# compare a tiny sample-ID signature and reuse the on-disk prototype, so a
+# normal detection never waits for 24 image downloads and CLIP embeddings.
+get_learned_profiles(force=True)
 
 logging.info("Beginning main loop...")
 
@@ -916,6 +1335,7 @@ try:
                 )
             elif detections:
                 detection_streak = 0
+                captured_epoch = int(current_time)
                 detected_classes = [d['class'] for d in detections]
                 logging.info(f"Detected {len(detections)} objects: {detected_classes}")
 
@@ -942,8 +1362,97 @@ try:
                 # frame's box: this frame is POST_DETECTION_SETTLE_FRAMES
                 # later and the cat has usually moved since.
                 animal_bbox = best_animal_bbox(frame)
+                frame_quality = score_detection_frame(frame, animal_bbox)
+
+                # Identity is the fast question and captioning is the slow one.
+                # Compare every reviewed animal together. The old static Cheeto
+                # prototype is only a fallback for households with no reviewed
+                # library; letting it decide first is what caused Rocky to be
+                # swallowed by a broad "orange cat" average.
+                cheeto_verdict, cheeto_score = 'unknown', 0.0
+                learned_profile = None
+                learned_score = learned_margin = 0.0
+                reviewed_profiles = get_learned_profiles()
+                if reviewed_profiles and 'match_learned_profiles' in globals():
+                    learned_profile, learned_score, learned_margin = match_learned_profiles(
+                        full_image_path,
+                        animal_bbox,
+                        reviewed_profiles,
+                        threshold=LEARNED_PROFILE_THRESHOLD,
+                        min_margin=LEARNED_PROFILE_MIN_MARGIN,
+                        num_threads=CHEETO_ID_THREADS,
+                    )
+                    if learned_profile:
+                        logging.info(
+                            "Reviewed visitor ID: %s (similarity %.3f, margin %.3f).",
+                            learned_profile['name'], learned_score, learned_margin)
+                        cheeto_verdict = ('cheeto'
+                                          if learned_profile['slug'] == 'cheeto'
+                                          else 'not_cheeto')
+                        cheeto_score = learned_score
+                elif _CHEETO_PROTOTYPE and identify_cheeto:
+                    cheeto_verdict, cheeto_score = identify_cheeto(
+                        full_image_path, animal_bbox, _CHEETO_PROTOTYPE,
+                        num_threads=CHEETO_ID_THREADS,
+                    )
+                    logging.info(
+                        f"Cheeto ID: {cheeto_verdict} (similarity "
+                        f"{cheeto_score:.3f} vs threshold "
+                        f"{_CHEETO_PROTOTYPE['threshold']:.3f})"
+                    )
+
+                known_name = (learned_profile['name'] if learned_profile else
+                              ('Cheeto' if cheeto_verdict == 'cheeto' else None))
+                known_slug = (learned_profile['slug'] if learned_profile else
+                              ('cheeto' if cheeto_verdict == 'cheeto' else None))
+                known_animal_id = (learned_profile['animal_id']
+                                   if learned_profile else None)
+                known_score = (learned_score if learned_profile else cheeto_score)
+                known_source = ('clip-reviewed-exemplars' if learned_profile
+                                else ('clip-prototype'
+                                      if cheeto_verdict == 'cheeto' else None))
 
                 early_settings = get_notification_settings()
+                temp = weather = icon = None
+                storage = None
+                pushed = False
+
+                if known_name:
+                    temp, weather, icon = fetch_weather_data()
+                    fast_description = f"{known_name} is at the door."
+                    storage = upload_detection_to_supabase(
+                        timestamp, fast_description, full_image_path,
+                        detected_classes, detectionTemp=temp,
+                        detectionWeather=weather, detectionIcon=icon,
+                        captured_epoch=captured_epoch,
+                        identity_label=known_slug,
+                        identity_confidence=known_score,
+                        identity_source=known_source,
+                        animal_id=known_animal_id, bbox=animal_bbox,
+                        needs_review=False,
+                        frame_quality=frame_quality,
+                    )
+                    subject, fast_message = build_notification(
+                        [('cat' if cheeto_verdict == 'cheeto' else
+                          learned_profile.get('species', 'animal'))],
+                        False, None, fast_description,
+                        temp, weather, captured_epoch, known_name=known_name,
+                        settings=early_settings)
+                    if should_alert_for_visit(early_settings, storage):
+                        include_photo = early_settings.get(
+                            'notification_include_photo', True)
+                        send_pushover_notification(
+                            message=fast_message, title=subject,
+                            image_path=(full_image_path if include_photo else None),
+                            priority=0)
+                        send_push_notification(
+                            message=fast_message, title=subject,
+                            image_path=((storage or {}).get('thumb_path')
+                                        if include_photo else None),
+                            priority=0)
+                        pushed = True
+                    logging.info("Fast-path known-visitor alert completed before captioning.")
+
                 use_local = early_settings.get('use_local_ai', True)
                 if use_local:
                     caption_image = crop_for_caption(
@@ -961,7 +1470,8 @@ try:
                 # of camera reads and CPU building a file we then deleted
                 # unsent, starving Florence of cores on a 4-core Pi.
                 gif_path = None
-                if early_settings['email_enabled']:
+                if (early_settings['email_enabled'] and
+                        early_settings.get('notification_include_photo', True)):
                     gif_path = f'detection_{timestamp}.gif'
                     try:
                         capture_burst_gif(cap, frame, gif_path)
@@ -991,7 +1501,9 @@ try:
                 # visible, or the caption describes an animal-free scene.
                 # Catches YOLO hallucinating a "dog" from shadows or the
                 # doormat pattern.
-                if vlm_says_absent or should_suppress(detected_classes, description):
+                if (not known_name and
+                        (vlm_says_absent or
+                         should_suppress(detected_classes, description))):
                     logging.info(
                         "Suppressing alert: AI says no animal present. "
                         f"YOLO classes were {detected_classes}, "
@@ -1010,24 +1522,9 @@ try:
                     cooldown_end_time = current_time + 30
                     continue
 
-                # Ask the prototype whether this is Cheeto. Runs here rather
-                # than alongside Florence so it never delays the GIF burst,
-                # and only after the suppression check so a false positive
-                # doesn't cost a CLIP inference.
-                cheeto_verdict, cheeto_score = 'unknown', 0.0
-                if _CHEETO_PROTOTYPE and identify_cheeto:
-                    cheeto_verdict, cheeto_score = identify_cheeto(
-                        full_image_path, animal_bbox, _CHEETO_PROTOTYPE,
-                        num_threads=CHEETO_ID_THREADS,
-                    )
-                    logging.info(
-                        f"Cheeto ID: {cheeto_verdict} (similarity "
-                        f"{cheeto_score:.3f} vs threshold "
-                        f"{_CHEETO_PROTOTYPE['threshold']:.3f})"
-                    )
-
                 # Fetch weather data
-                temp, weather, icon = fetch_weather_data()
+                if temp is None:
+                    temp, weather, icon = fetch_weather_data()
 
                 # Report what the VLM caption says is there, not YOLO's raw
                 # label — the nano model loves calling the cat a cow/elephant/
@@ -1040,31 +1537,10 @@ try:
                         f"YOLO's raw labels were {detected_classes}."
                     )
 
-                # Subject is generic — Florence-2 doesn't generate titles. The
-                # rich content goes in the body + GIF attachment. "Possible"
-                # when the species came from a local-model guess: the alert
-                # should never assert a fox it isn't sure about.
-                eastern_now = datetime.now(timezone('US/Eastern'))
-                time_str = eastern_now.strftime('%-I:%M %p ET')
-                if len(reported_classes) == 1:
-                    label = reported_classes[0]
-                    subject = (f"Possible {label} at the door 🐾" if hedged
-                               else f"{label.title()} at the door 🐾")
-                else:
-                    joined = ', '.join(reported_classes)
-                    subject = (f"Possibly spotted: {joined} 🐾" if hedged
-                               else f"Spotted: {joined} 🐾")
-
-                body_lines = [f"{time_str} · {', '.join(reported_classes)}"]
-                if correction_note:
-                    body_lines.append(correction_note)
-                if description:
-                    body_lines.append("")
-                    body_lines.append(description)
-                if temp and weather:
-                    body_lines.append("")
-                    body_lines.append(f"Weather: {temp:.0f}°F, {weather}")
-                message = "\n".join(body_lines)
+                subject, message = build_notification(
+                    reported_classes, hedged, correction_note, description,
+                    temp, weather, captured_epoch,
+                    known_name=known_name, settings=early_settings)
 
                 # Email gets both still + GIF (GIF animates in mail clients).
                 # Push gets the STILL JPEG thumbnail — smartwatches (Apple Watch,
@@ -1072,8 +1548,10 @@ try:
                 # often render GIFs as a blank frame in their tiny notification
                 # surface, killing the at-a-glance preview. That still now comes
                 # from Storage rather than being attached to the request.
-                attachments = [full_image_path]
-                if gif_path and os.path.exists(gif_path):
+                attachments = ([full_image_path]
+                               if early_settings.get('notification_include_photo', True)
+                               else [])
+                if (attachments and gif_path and os.path.exists(gif_path)):
                     attachments.append(gif_path)
 
                 settings = get_notification_settings()
@@ -1097,33 +1575,57 @@ try:
                         )
                     push_priority = 1
 
-                # Upload runs FIRST now: the push references the image by its
-                # Storage path, so the file has to exist before the alert goes
-                # out. Previously the push carried the JPEG as an attachment and
-                # order did not matter.
-                storage = upload_detection_to_supabase(
-                    timestamp, description, full_image_path,
-                    reported_classes, detectionTemp=temp,
-                    detectionWeather=weather, detectionIcon=icon,
-                )
+                identity_label = (known_slug if known_slug
+                                  else (reported_classes[0]
+                                        if len(reported_classes) == 1
+                                        else 'unknown'))
+                identity_source = (known_source
+                                   if known_source
+                                   else caption_source)
+                needs_review = (not known_name and
+                                (reported_classes == ['animal'] or hedged))
+
+                if storage:
+                    update_detection_details(
+                        storage.get('detection_id'), description, temp, weather,
+                        icon, identity_label, known_score, identity_source,
+                        needs_review)
+                else:
+                    # Upload runs before push because the notification fetches
+                    # the thumbnail from Storage.
+                    storage = upload_detection_to_supabase(
+                        timestamp, description, full_image_path,
+                        detected_classes, detectionTemp=temp,
+                        detectionWeather=weather, detectionIcon=icon,
+                        captured_epoch=captured_epoch,
+                        identity_label=identity_label,
+                        identity_confidence=known_score,
+                        identity_source=identity_source,
+                        animal_id=known_animal_id, bbox=animal_bbox,
+                        needs_review=needs_review,
+                        frame_quality=frame_quality,
+                    )
 
                 # Both notifiers fire while the self-hosted path is on trial, so
                 # expect two alerts per detection until ENABLE_PUSHOVER is set
                 # to 0. Pushover attaches the LOCAL jpeg; the dispatcher refers
                 # to the thumbnail already in Storage.
-                send_pushover_notification(
-                    message=message,
-                    title=subject,
-                    image_path=full_image_path,
-                    priority=push_priority,
-                )
+                if not pushed and should_alert_for_visit(settings, storage):
+                    include_photo = settings.get('notification_include_photo', True)
+                    send_pushover_notification(
+                        message=message,
+                        title=subject,
+                        image_path=(full_image_path if include_photo else None),
+                        priority=push_priority,
+                    )
 
-                send_push_notification(
-                    message=message,
-                    title=subject,
-                    image_path=(storage or {}).get('thumb_path'),
-                    priority=push_priority,
-                )
+                    send_push_notification(
+                        message=message,
+                        title=subject,
+                        image_path=((storage or {}).get('thumb_path')
+                                    if include_photo else None),
+                        priority=push_priority,
+                    )
 
                 # Clean up local files so the Pi disk doesn't fill up.
                 for p in (full_image_path, gif_path):
