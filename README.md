@@ -93,6 +93,36 @@ the detector logs a warning once rather than pretend otherwise. The device's
 own sleep and keep-alive behaviour is deliberately untouched — see the power
 bank note in `cheeto-infra/devices/README.md`.
 
+### Rewind
+
+The live endpoint keeps the last `REWIND_SECONDS` (default 15) of video, and
+audio where the camera has a microphone, and muxes them to MP4 on demand at
+`/rewind.mp4?token=…&seconds=15`. Nothing is written to disk until somebody
+asks; the buffer is in memory and bounded.
+
+Measured on the four-core Pi, front-door at 640x480:
+
+| | |
+|---|---|
+| One recorded frame | 39 KB, 3.2 ms to encode |
+| 15 s of video at `REWIND_FPS=4` | ~2.4 MB |
+| 15 s of audio (s16le mono 16k) | 0.5 MB |
+| Recorder cost | ~1.3% of one core |
+| Muxing a 15 s clip (libx264 ultrafast) | ~1.7 s, ~2.2 MB |
+
+`REWIND_MAX_BYTES` (default 16MB) is the budget that actually binds, and the
+ring is trimmed by bytes before seconds — the same fifteen seconds is a few
+megabytes of a still driveway and considerably more of a hedge in the wind.
+`h264_v4l2m2m` is present in this Pi's ffmpeg but has no usable device, so
+`libx264` is the encoder.
+
+Set `REWIND_ENABLED=0` to turn it off, or `REWIND_AUDIO=0` to keep the clips
+but never hold the microphone open. Audio recording only starts where
+`STREAM_AUDIO_ENABLED` is on, so the cameras that share a Pi do not fight over
+one ALSA device. The microphone is opened once and shared between the rewind
+recorder and `/audio.mp3`, which also means a second live listener no longer
+gets turned away.
+
 Each service has equal systemd CPU weight and a 150% CPU ceiling, leaving one
 core of headroom on a four-core Pi when two feeds are busy. Capture and
 lightweight YOLO run per camera, while CLIP/Florence jobs use a shared local inference gate
