@@ -27,7 +27,7 @@ from caption_logic import (
     resolve_reported_classes,
 )
 from alert_logic import should_alert
-from capture_gate import should_capture, should_detect
+from capture_gate import capture_interval, should_capture, should_detect
 from inference_gate import inference_slot
 from camera_source import HttpSnapshotCapture
 # Module level, NOT inside the ENABLE_CHEETO_ID block below: the caption crop
@@ -126,6 +126,14 @@ CAMERA_CAPTURE_ON_MOTION = os.getenv(
     '1', 'true', 'yes', 'on')
 CAPTURE_IDLE_POLL_SECONDS = max(
     0.1, float(os.getenv('CAPTURE_IDLE_POLL_SECONDS', '0.5')))
+CAMERA_SNAPSHOT_INTERVAL = max(
+    0.0, float(os.getenv('CAMERA_SNAPSHOT_INTERVAL', '0.2')))
+# The poll rate a saver-mode camera drops to while its yard is quiet, and how
+# long any sighting — confirmed or not — buys back the full rate for.
+CAMERA_SAVER_SNAPSHOT_INTERVAL = max(
+    0.0, float(os.getenv('CAMERA_SAVER_SNAPSHOT_INTERVAL', '1.0')))
+CAMERA_SAVER_ACTIVE_SECONDS = max(
+    0.0, float(os.getenv('CAMERA_SAVER_ACTIVE_SECONDS', '20')))
 CAMERA_CONTROL_URL = os.getenv('CAMERA_CONTROL_URL', '').strip().rstrip('/')
 CAMERA_CONTROL_USERNAME = os.getenv(
     'CAMERA_CONTROL_USERNAME', 'cheetocam').strip()
@@ -363,45 +371,84 @@ def _motion_detection_allowed():
     return should_detect(motion_gated, motion_gated and _motion_sensor_active())
 
 
-_rotation_checked = 0.0
+_camera_settings_checked = 0.0
 _rotation_value = None
+_battery_saver_value = False
 
 
-def _published_rotation():
-    """The rotation the household has chosen for this camera, or None.
+def _refresh_published_camera_settings():
+    """Re-read this camera's own row on the notification-settings cadence.
 
-    Polled on the same cadence as notification settings so a camera that gets
-    repositioned can be put right from the app instead of an SSH session and a
-    detector restart.
+    Everything the household can change about a running camera comes from here,
+    in one round trip: a camera that gets repositioned or put into saver mode is
+    fixed from the app instead of an SSH session and a detector restart. Values
+    already held are kept if the read fails, so a Supabase blip changes nothing.
     """
-    global _rotation_checked, _rotation_value
+    global _camera_settings_checked, _rotation_value, _battery_saver_value
     now = time.time()
-    if now - _rotation_checked < SETTINGS_REFRESH_SECONDS:
-        return _rotation_value
-    _rotation_checked = now
+    if now - _camera_settings_checked < SETTINGS_REFRESH_SECONDS:
+        return
+    _camera_settings_checked = now
     try:
         resp = (supabase_client.table('camera_status')
-                .select('rotation_degrees')
+                .select('rotation_degrees,battery_saver')
                 .eq('household_id', HOUSEHOLD_ID).eq('camera_id', CAMERA_ID)
                 .limit(1).execute())
         rows = resp.data or []
-        if rows and rows[0].get('rotation_degrees') is not None:
+        if not rows:
+            return
+        if rows[0].get('rotation_degrees') is not None:
             value = int(rows[0]['rotation_degrees']) % 360
             if value in (0, 90, 180, 270):
                 _rotation_value = value
+        if rows[0].get('battery_saver') is not None:
+            _battery_saver_value = bool(rows[0]['battery_saver'])
     except Exception as exc:
-        logging.debug('Could not read published rotation: %s', exc)
-    return _rotation_value
+        logging.debug('Could not read published camera settings: %s', exc)
+
+
+def _battery_saver_enabled():
+    return _battery_saver_value
 
 
 def _apply_published_rotation(capture):
     """Point the capture adapter at the household's chosen rotation."""
-    rotation = _published_rotation()
+    rotation = _rotation_value
     if rotation is None or not hasattr(capture, 'rotation_degrees'):
         return
     if capture.rotation_degrees != rotation:
         logging.info('Camera rotation changed to %d degrees.', rotation)
         capture.rotation_degrees = rotation
+
+
+_saver_unsupported_warned = False
+
+
+def _apply_capture_interval(capture, last_activity_epoch):
+    """Slow a quiet saver-mode camera's poll, and speed it back up on demand."""
+    if not hasattr(capture, 'interval_seconds'):
+        # A stream-mode camera transmits whether or not the Pi reads, so there
+        # is no poll here to slow. Say so once rather than let the household
+        # believe a switch they turned on is doing something.
+        global _saver_unsupported_warned
+        if _battery_saver_enabled() and not _saver_unsupported_warned:
+            _saver_unsupported_warned = True
+            logging.warning(
+                'Battery saver is on for %s but has no effect in stream '
+                'capture mode; it needs CAMERA_CAPTURE_MODE=snapshot.',
+                CAMERA_ID)
+        return
+    viewers = live_stream.viewers() if live_stream is not None else 0
+    interval = capture_interval(
+        CAMERA_SNAPSHOT_INTERVAL,
+        CAMERA_SAVER_SNAPSHOT_INTERVAL,
+        _battery_saver_enabled(),
+        viewers,
+        time.time() - last_activity_epoch < CAMERA_SAVER_ACTIVE_SECONDS,
+    )
+    if capture.interval_seconds != interval:
+        logging.info('Camera poll interval now %.2fs.', interval)
+        capture.interval_seconds = interval
 
 
 def _capture_allowed():
@@ -476,7 +523,7 @@ def _open_camera():
     if CAMERA_CAPTURE_MODE == 'snapshot':
         return HttpSnapshotCapture(
             camera_input,
-            interval_seconds=float(os.getenv('CAMERA_SNAPSHOT_INTERVAL', '0.2')),
+            interval_seconds=CAMERA_SNAPSHOT_INTERVAL,
             timeout_seconds=float(os.getenv('CAMERA_SNAPSHOT_TIMEOUT', '5')),
             rotation_degrees=int(os.getenv('CAMERA_ROTATION', '0')),
         )
@@ -1740,6 +1787,9 @@ next_observation_time = 0.0
 next_alert_time = 0.0
 detection_streak = 0  # consecutive frames with a target class in view
 _capture_idle = False  # true while capture is paused waiting for the sensor
+# Any sighting at all, confirmed or not. Battery saver reads this to decide
+# that now is not the moment to be economical about frames.
+_last_activity_epoch = 0.0
 
 try:
     while True:
@@ -1762,7 +1812,9 @@ try:
             _capture_idle = False
             logging.info('Motion or a live viewer; resuming frame capture.')
 
+        _refresh_published_camera_settings()
         _apply_published_rotation(cap)
+        _apply_capture_interval(cap, _last_activity_epoch)
         ret, frame = cap.read()
         if not ret:
             if not CAMERA_MOTION_WAKE:
@@ -1809,6 +1861,7 @@ try:
 
             if detections:
                 detection_streak += 1
+                _last_activity_epoch = current_time
             else:
                 detection_streak = 0
 

@@ -82,6 +82,17 @@ polls and decodes those frames through the same capture interface used by video
 sources. Set `CAMERA_ROTATION` to `90`, `180`, or `270` when the camera module's
 fixed orientation does not match its mounting position.
 
+Battery saver, toggled per camera from the app, slows that same poll to
+`CAMERA_SAVER_SNAPSHOT_INTERVAL` (default `1.0` seconds) while nothing is
+happening, and restores the full rate the moment somebody opens live view or
+the detector sees anything at all — confirmed or not — for the next
+`CAMERA_SAVER_ACTIVE_SECONDS` (default `20`). It only applies to
+`CAMERA_CAPTURE_MODE=snapshot`: a camera the Pi reads as a stream is
+transmitting whether or not the Pi reads it, so there is no poll to slow, and
+the detector logs a warning once rather than pretend otherwise. The device's
+own sleep and keep-alive behaviour is deliberately untouched — see the power
+bank note in `cheeto-infra/devices/README.md`.
+
 Each service has equal systemd CPU weight and a 150% CPU ceiling, leaving one
 core of headroom on a four-core Pi when two feeds are busy. Capture and
 lightweight YOLO run per camera, while CLIP/Florence jobs use a shared local inference gate
