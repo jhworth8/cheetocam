@@ -363,6 +363,47 @@ def _motion_detection_allowed():
     return should_detect(motion_gated, motion_gated and _motion_sensor_active())
 
 
+_rotation_checked = 0.0
+_rotation_value = None
+
+
+def _published_rotation():
+    """The rotation the household has chosen for this camera, or None.
+
+    Polled on the same cadence as notification settings so a camera that gets
+    repositioned can be put right from the app instead of an SSH session and a
+    detector restart.
+    """
+    global _rotation_checked, _rotation_value
+    now = time.time()
+    if now - _rotation_checked < SETTINGS_REFRESH_SECONDS:
+        return _rotation_value
+    _rotation_checked = now
+    try:
+        resp = (supabase_client.table('camera_status')
+                .select('rotation_degrees')
+                .eq('household_id', HOUSEHOLD_ID).eq('camera_id', CAMERA_ID)
+                .limit(1).execute())
+        rows = resp.data or []
+        if rows and rows[0].get('rotation_degrees') is not None:
+            value = int(rows[0]['rotation_degrees']) % 360
+            if value in (0, 90, 180, 270):
+                _rotation_value = value
+    except Exception as exc:
+        logging.debug('Could not read published rotation: %s', exc)
+    return _rotation_value
+
+
+def _apply_published_rotation(capture):
+    """Point the capture adapter at the household's chosen rotation."""
+    rotation = _published_rotation()
+    if rotation is None or not hasattr(capture, 'rotation_degrees'):
+        return
+    if capture.rotation_degrees != rotation:
+        logging.info('Camera rotation changed to %d degrees.', rotation)
+        capture.rotation_degrees = rotation
+
+
 def _capture_allowed():
     """Whether it is worth pulling a frame from the camera at all.
 
@@ -1721,6 +1762,7 @@ try:
             _capture_idle = False
             logging.info('Motion or a live viewer; resuming frame capture.')
 
+        _apply_published_rotation(cap)
         ret, frame = cap.read()
         if not ret:
             if not CAMERA_MOTION_WAKE:

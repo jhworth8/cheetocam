@@ -13,6 +13,12 @@ WorkingDirectory=/home/jesse/cheetocam
 ExecStart=/usr/bin/python3 /home/jesse/cheetocam/critter_detector.py
 Restart=always
 RestartSec=5
+# Two cameras share a four-core Pi without starving live video, networking, or
+# the API client. CPUWeight keeps the split fair; CPUQuota leaves one core of
+# headroom even when both camera pipelines are busy.
+CPUWeight=100
+CPUQuota=150%
+Nice=5
 Environment=PATH=/usr/bin:/usr/local/bin
 
 [Install]

@@ -1,0 +1,24 @@
+# Multi-camera systemd template. `%i` is the stable camera id, for example
+# `cat_detector@back-yard.service`, and selects `.env.back-yard`.
+[Unit]
+Description=Critter Cam detector (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jesse
+WorkingDirectory=/home/jesse/cheetocam
+Environment=PATH=/usr/bin:/usr/local/bin
+Environment=CRITTER_ENV_FILE=/home/jesse/cheetocam/.env.%i
+ExecStart=/usr/bin/python3 /home/jesse/cheetocam/critter_detector.py
+Restart=always
+RestartSec=30
+# Give every camera the same share and preserve one core of headroom on the
+# four-core Cheeto Pi when two detector instances are running.
+CPUWeight=100
+CPUQuota=150%
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

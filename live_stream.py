@@ -34,6 +34,7 @@ _lock = threading.Lock()
 _frame = None          # most recent BGR frame from the detector
 _seq = 0               # bumped per frame so viewers can wait for a *new* one
 _viewers = 0           # live MJPEG connections
+_last_viewer_request = 0.0  # polling Flutter client's most recent request
 _token = ''
 _started = False
 _audio_lock = threading.Lock()
@@ -59,8 +60,25 @@ def publish(frame):
         pass
 
 
+def clear():
+    """Discard the last frame when a wireless camera returns to sleep."""
+    global _frame, _seq
+    try:
+        with _lock:
+            _frame = None
+            _seq += 1
+    except Exception:
+        pass
+
+
 def viewers():
-    return _viewers
+    """Number of active viewers, including the app's snapshot-polling mode.
+
+    Flutter uses short authenticated snapshot requests rather than holding an
+    MJPEG socket open. Treat requests within the last 12 seconds as one viewer
+    so a sleeping wireless camera can be asked to wake and remain awake.
+    """
+    return _viewers + (1 if time.time() - _last_viewer_request < 12 else 0)
 
 
 def ready():
@@ -75,7 +93,13 @@ def audio_available():
     checks the encoder and device nodes. The endpoint still handles a device
     disappearing without affecting video or detection.
     """
-    return bool(_started and shutil.which('ffmpeg') and os.path.isdir('/dev/snd'))
+    enabled = os.getenv('STREAM_AUDIO_ENABLED', '1').strip().lower()
+    return bool(
+        enabled not in ('0', 'false', 'no', 'off')
+        and _started
+        and shutil.which('ffmpeg')
+        and os.path.isdir('/dev/snd')
+    )
 
 
 def _encode_latest(quality=None, max_width=None):
@@ -132,7 +156,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        global _viewers
+        global _viewers, _last_viewer_request
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -151,7 +175,20 @@ class _Handler(BaseHTTPRequestHandler):
             self._deny()
             return
 
+        # Reaching any authenticated media endpoint means a person is actively
+        # trying to view this camera, even if no frame exists yet.
+        _last_viewer_request = time.time()
+
         if path == '/audio.mp3':
+            if not audio_available():
+                body = b'audio unavailable'
+                self.send_response(404)
+                self.send_header('Content-Type', 'text/plain')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if not _audio_lock.acquire(blocking=False):
                 body = b'audio already in use'
                 self.send_response(409)
