@@ -26,6 +26,10 @@ from caption_logic import (
     should_suppress,
     resolve_reported_classes,
 )
+from alert_logic import should_alert
+from capture_gate import should_capture, should_detect
+from inference_gate import inference_slot
+from camera_source import HttpSnapshotCapture
 # Module level, NOT inside the ENABLE_CHEETO_ID block below: the caption crop
 # needs this whether or not prototype ID is switched on. cheeto_id only pulls
 # in numpy and PIL at import time (torch is loaded lazily inside functions),
@@ -41,15 +45,21 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 
-# Load environment variables
-load_dotenv()
+# Each camera process can point at a different private environment file. The
+# original single-camera service still defaults to `.env`, so existing installs
+# keep working unchanged.
+ENV_FILE = os.getenv('CRITTER_ENV_FILE', '.env').strip() or '.env'
+load_dotenv(ENV_FILE)
+LOG_CAMERA_ID = re.sub(
+    r'[^a-zA-Z0-9_-]+', '-', os.getenv('CAMERA_ID', 'front-door')
+).strip('-') or 'front-door'
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("cat_detector.log"),
+        logging.FileHandler(f"cat_detector.{LOG_CAMERA_ID}.log"),
         logging.StreamHandler()
     ]
 )
@@ -59,7 +69,10 @@ logging.info("Starting enhanced cat detection system with YOLOv11, Supabase and 
 # Email and API configuration
 SENDER_EMAIL = os.getenv('SENDER_EMAIL')
 SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
-# Env recipients are fallbacks used only when notification_settings has no entries
+# Env recipients seed a household that has no notification_settings row yet. Once
+# a row exists, its lists are authoritative — including when they are empty. The
+# old "fall back whenever the list is empty" rule meant deleting the last
+# recipient in the dashboard silently restored everyone in this .env.
 ENV_PHONE_RECIPIENTS = [r.strip() for r in os.getenv('PHONE_RECIPIENTS', '').split(',') if r.strip()]
 ENV_EMAIL_RECIPIENTS = [r.strip() for r in os.getenv('EMAIL_RECIPIENTS', '').split(',') if r.strip()]
 ENV_BOTHER_EMAIL = os.getenv('BOTHER_EMAIL', '').strip()
@@ -78,7 +91,7 @@ OPENWEATHER_API_KEY = os.getenv('OPENWEATHER_API_KEY')
 # flipping one env var rather than editing code.
 PUSHOVER_USER_KEY = os.getenv('PUSHOVER_USER_KEY', '')
 PUSHOVER_API_TOKEN = os.getenv('PUSHOVER_API_TOKEN', '')
-ENABLE_PUSHOVER = int(os.getenv('ENABLE_PUSHOVER', '1'))
+ENABLE_PUSHOVER = int(os.getenv('ENABLE_PUSHOVER', '0'))
 
 PUSH_DISPATCH_URL = os.getenv('PUSH_DISPATCH_URL', 'http://192.168.86.113:8090/push')
 PUSH_DISPATCH_TOKEN = os.getenv('PUSH_DISPATCH_TOKEN', '')
@@ -94,8 +107,36 @@ DEFAULT_HOUSEHOLD_ID = '486f6c6c-696e-4773-8000-000000000001'
 HOUSEHOLD_ID = os.getenv('HOUSEHOLD_ID', DEFAULT_HOUSEHOLD_ID).strip()
 CAMERA_ID = os.getenv('CAMERA_ID', 'front-door').strip() or 'front-door'
 CAMERA_NAME = os.getenv('CAMERA_NAME', 'Front door').strip() or 'Front door'
+CAMERA_SOURCE = os.getenv('CAMERA_SOURCE', '/dev/video0').strip() or '/dev/video0'
+CAMERA_SOURCE_KIND = os.getenv('CAMERA_SOURCE_KIND', '').strip().lower() or (
+    'wireless' if CAMERA_SOURCE.startswith(('rtsp://', 'rtsps://', 'http://', 'https://'))
+    else 'usb')
+CAMERA_CAPTURE_MODE = os.getenv(
+    'CAMERA_CAPTURE_MODE', CAMERA_SOURCE_KIND).strip().lower()
+CAMERA_MOTION_WAKE = os.getenv('CAMERA_MOTION_WAKE', '0').strip().lower() in (
+    '1', 'true', 'yes', 'on')
+# A camera that stays powered but has its own motion sensor. Unlike a
+# deep-sleeping camera it can always answer, which is exactly why it needs
+# this: without it the detector pulls a full frame several times a second
+# forever, spending the camera's Wi-Fi and the Pi's JPEG decoder on an empty
+# driveway. Frames are fetched only inside a motion window or while somebody
+# is actually watching live.
+CAMERA_CAPTURE_ON_MOTION = os.getenv(
+    'CAMERA_CAPTURE_ON_MOTION', '0').strip().lower() in (
+    '1', 'true', 'yes', 'on')
+CAPTURE_IDLE_POLL_SECONDS = max(
+    0.1, float(os.getenv('CAPTURE_IDLE_POLL_SECONDS', '0.5')))
+CAMERA_CONTROL_URL = os.getenv('CAMERA_CONTROL_URL', '').strip().rstrip('/')
+CAMERA_CONTROL_USERNAME = os.getenv(
+    'CAMERA_CONTROL_USERNAME', 'cheetocam').strip()
+CAMERA_CONTROL_PASSWORD = os.getenv('CAMERA_CONTROL_PASSWORD', '').strip()
 HEARTBEAT_SECONDS = max(15, int(os.getenv('HEARTBEAT_SECONDS', '30')))
 PROCESS_STARTED_EPOCH = int(time.time())
+LOCAL_AI_THREADS = max(1, int(os.getenv('LOCAL_AI_THREADS', '2')))
+AI_IDENTITY_WAIT_SECONDS = max(
+    0.0, float(os.getenv('AI_IDENTITY_WAIT_SECONDS', '3')))
+AI_CAPTION_QUEUE_SECONDS = max(
+    1.0, float(os.getenv('AI_CAPTION_QUEUE_SECONDS', '50')))
 
 # How often to re-fetch notification_settings from Supabase
 SETTINGS_REFRESH_SECONDS = int(os.getenv('SETTINGS_REFRESH_SECONDS', '30'))
@@ -132,6 +173,11 @@ ENABLE_MULTI_CLASS_DETECTION = 1
 CONFIRM_FRAMES = int(os.getenv('CONFIRM_FRAMES', '2'))
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '180'))
+# Saving another useful view of a visitor is not the same thing as alerting the
+# household again.  Keep observing once a minute while alert cooldown/visit
+# policy is enforced independently below.
+OBSERVATION_INTERVAL_SECONDS = max(
+    30, int(os.getenv('OBSERVATION_INTERVAL_SECONDS', '60')))
 FRAME_DELAY = float(os.getenv('FRAME_DELAY', '0.2'))
 
 # Florence-2 (local VLM via HuggingFace transformers) configuration.
@@ -174,9 +220,9 @@ ENABLE_FLORENCE = int(os.getenv('ENABLE_FLORENCE', '1'))
 # as it did before.
 CHEETO_PROTOTYPE_PATH = os.getenv('CHEETO_PROTOTYPE_PATH', 'cheeto_prototype.npz')
 ENABLE_CHEETO_ID = int(os.getenv('ENABLE_CHEETO_ID', '1'))
-# CLIP shares the Pi's 4 cores with Florence. Leave one free so a detection
-# doesn't starve the capture loop and drop frames.
-CHEETO_ID_THREADS = int(os.getenv('CHEETO_ID_THREADS', '3'))
+# Separate camera services share four Pi cores. Two threads per local model plus
+# the cross-process inference gate keeps capture/live view responsive.
+CHEETO_ID_THREADS = int(os.getenv('CHEETO_ID_THREADS', str(LOCAL_AI_THREADS)))
 LEARNED_PROFILE_REFRESH_SECONDS = int(os.getenv('LEARNED_PROFILE_REFRESH_SECONDS', '300'))
 LEARNED_PROFILE_THRESHOLD = float(os.getenv('LEARNED_PROFILE_THRESHOLD', '0.90'))
 LEARNED_PROFILE_MIN_MARGIN = float(os.getenv('LEARNED_PROFILE_MIN_MARGIN', '0.015'))
@@ -192,10 +238,46 @@ SUPABASE_URL = os.getenv('SUPABASE_URL', '')
 SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY', '')
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
+
+def publish_stream_config():
+    """Publish only what the signed-in app needs to open this live feed.
+
+    The source URL is intentionally excluded: wireless camera credentials stay
+    in the Pi's local .env. Each camera gets namespaced keys; the original
+    front-door aliases remain readable by older app builds.
+    """
+    public_base = os.getenv('STREAM_PUBLIC_BASE', '').strip().rstrip('/')
+    stream_token = os.getenv('STREAM_TOKEN', '').strip()
+    if not (public_base and stream_token):
+        return False
+    rows = [
+        {'household_id': HOUSEHOLD_ID, 'key': f'stream_base:{CAMERA_ID}',
+         'value': public_base},
+        {'household_id': HOUSEHOLD_ID, 'key': f'stream_token:{CAMERA_ID}',
+         'value': stream_token},
+    ]
+    if CAMERA_ID == 'front-door':
+        rows.extend([
+            {'household_id': HOUSEHOLD_ID, 'key': 'stream_base',
+             'value': public_base},
+            {'household_id': HOUSEHOLD_ID, 'key': 'stream_token',
+             'value': stream_token},
+        ])
+    try:
+        for row in rows:
+            (supabase_client.table('app_config')
+             .upsert(row, on_conflict='household_id,key').execute())
+        logging.info("Published live configuration for camera %s.", CAMERA_ID)
+        return True
+    except Exception as exc:
+        logging.warning("Could not publish live camera configuration: %s", exc)
+        return False
+
 _last_frame_epoch = None
 _last_detection_epoch = None
 _heartbeat_error = None
 _heartbeat_stop = threading.Event()
+_camera_sleeping = False
 
 
 def detector_version():
@@ -223,21 +305,220 @@ DETECTOR_VERSION = detector_version()
 _settings_cache = {
     'fetched_at': 0.0,
     'value': {
-        'email_enabled': True,
-        'pushover_enabled': True,
+        'email_enabled': False,
+        'pushover_enabled': False,
         'email_recipients': ENV_EMAIL_RECIPIENTS,
         'phone_recipients': ENV_PHONE_RECIPIENTS,
         'bother_email': ENV_BOTHER_EMAIL,
         'cooldown_seconds': COOLDOWN_DURATION,
-        # Preserve today's behaviour unless the owner explicitly chooses the
-        # visit-aware notification mode in a newer client.
-        'alert_mode': 'every_detection',
+        # Fail quiet if settings are temporarily unreachable: observations are
+        # still saved, but one animal sitting still cannot create alert spam.
+        'alert_mode': 'first_of_visit',
         'notification_title_style': 'smart',
         'notification_include_photo': True,
         'notification_include_activity': True,
         'notification_include_weather': True,
     },
 }
+
+# Start the household-facing live endpoint before opening a motion-wake camera.
+# This lets the phone register demand while the camera itself is asleep.
+try:
+    import live_stream
+    live_stream.start(port=int(os.getenv('STREAM_PORT', '8088')),
+                      token=os.getenv('STREAM_TOKEN', ''))
+except Exception as _exc:
+    live_stream = None
+    logging.error("Live view unavailable: %s", _exc)
+
+
+def _set_live_hold(enabled):
+    """Best-effort local control; an asleep ESP is expected to refuse it."""
+    if not (CAMERA_CONTROL_URL and CAMERA_CONTROL_PASSWORD):
+        return False
+    action = 'turn_on' if enabled else 'turn_off'
+    try:
+        response = requests.post(
+            f'{CAMERA_CONTROL_URL}/switch/Live%20Hold/{action}',
+            auth=(CAMERA_CONTROL_USERNAME, CAMERA_CONTROL_PASSWORD),
+            timeout=2,
+        )
+        return response.ok
+    except requests.RequestException:
+        return False
+
+
+_motion_permission_checked = 0.0
+_motion_permission_value = False
+
+
+def _motion_detection_allowed():
+    """Only sensor events may create observations on a motion-gated camera.
+
+    Covers both shapes: a camera that deep-sleeps between PIR wakes, and one
+    that stays powered with a sensor attached. In each case a live view or a
+    scheduled check must never be able to manufacture an observation.
+    """
+    motion_gated = CAMERA_MOTION_WAKE or CAMERA_CAPTURE_ON_MOTION
+    return should_detect(motion_gated, motion_gated and _motion_sensor_active())
+
+
+def _capture_allowed():
+    """Whether it is worth pulling a frame from the camera at all.
+
+    Separate from the detection gate above: a live viewer deserves frames even
+    with nothing moving, but nobody needs a 720p JPEG every 200ms of an empty
+    yard.
+    """
+    if not CAMERA_CAPTURE_ON_MOTION:
+        return True
+    viewers = live_stream.viewers() if live_stream is not None else 0
+    return should_capture(
+        CAMERA_CAPTURE_ON_MOTION, viewers,
+        viewers == 0 and _motion_sensor_active())
+
+
+def _motion_sensor_active():
+    """Cached read of the camera's own motion sensor, once a second at most."""
+    global _motion_permission_checked, _motion_permission_value
+    now = time.time()
+    if now - _motion_permission_checked < 1:
+        return _motion_permission_value
+
+    _motion_permission_checked = now
+    auth = (CAMERA_CONTROL_USERNAME, CAMERA_CONTROL_PASSWORD)
+    try:
+        # Motion Wake stays latched for a real PIR boot. Motion covers the edge
+        # case where PIR becomes active during a timer/live window.
+        for entity in ('Motion%20Wake', 'Motion'):
+            response = requests.get(
+                f'{CAMERA_CONTROL_URL}/binary_sensor/{entity}',
+                auth=auth,
+                timeout=1,
+            )
+            if response.ok and response.json().get('value') is True:
+                _motion_permission_value = True
+                return True
+        _motion_permission_value = False
+    except (requests.RequestException, ValueError):
+        # Fail quiet: missing control metadata must not turn a scheduled live
+        # check into an animal alert.
+        _motion_permission_value = False
+    return _motion_permission_value
+
+
+def _live_hold_loop():
+    held = False
+    while not _heartbeat_stop.is_set():
+        wanted = bool(live_stream is not None and live_stream.viewers())
+        # Repeat turn_on while viewing. This both catches the ESP's next timer
+        # wake and renews its five-minute firmware safety timeout.
+        if wanted:
+            if _set_live_hold(True) and not held:
+                logging.info('Wireless camera claimed for live view.')
+                held = True
+        elif held and _set_live_hold(False):
+            logging.info('Wireless camera released after live view.')
+            held = False
+        _heartbeat_stop.wait(5)
+
+
+if CAMERA_MOTION_WAKE and CAMERA_CONTROL_URL:
+    threading.Thread(
+        target=_live_hold_loop,
+        daemon=True,
+        name='wireless-live-hold',
+    ).start()
+
+
+def _open_camera():
+    if CAMERA_CAPTURE_MODE == 'snapshot':
+        return HttpSnapshotCapture(
+            camera_input,
+            interval_seconds=float(os.getenv('CAMERA_SNAPSHOT_INTERVAL', '0.2')),
+            timeout_seconds=float(os.getenv('CAMERA_SNAPSHOT_TIMEOUT', '5')),
+            rotation_degrees=int(os.getenv('CAMERA_ROTATION', '0')),
+        )
+    capture = cv2.VideoCapture(camera_input)
+    capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return capture
+
+
+def _publish_waiting_for_motion():
+    now = int(time.time())
+    try:
+        (supabase_client.table('camera_status').upsert({
+            'household_id': HOUSEHOLD_ID,
+            'camera_id': CAMERA_ID,
+            'display_name': CAMERA_NAME,
+            'source_kind': CAMERA_SOURCE_KIND,
+            'detector_version': DETECTOR_VERSION,
+            'state': 'sleeping',
+            'process_started_epoch': PROCESS_STARTED_EPOCH,
+            'heartbeat_epoch': now,
+            'local_ai_ready': False,
+            # The Pi endpoint is ready to receive a live-view request even
+            # though it has no camera frame yet.
+            'live_ready': bool(live_stream is not None and live_stream.ready()),
+            'audio_available': False,
+            'error_message': None,
+            'metrics': {
+                'source_kind': CAMERA_SOURCE_KIND,
+                'power_mode': 'motion_wake',
+                'viewers': live_stream.viewers() if live_stream else 0,
+            },
+            'updated_at': datetime.now(timezone('UTC')).isoformat(),
+        }, on_conflict='household_id,camera_id').execute())
+    except Exception as exc:
+        logging.warning('Could not publish sleeping camera state: %s', exc)
+
+
+# Open the camera before loading YOLO/Florence. A motion-wake source being
+# unavailable is expected deep sleep, not a crash. Keep its lightweight live
+# endpoint running and wait for PIR or a timer/live wake.
+if CAMERA_SOURCE.startswith(('rtsp://', 'rtsps://')):
+    os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
+camera_input = int(CAMERA_SOURCE) if CAMERA_SOURCE.isdigit() else CAMERA_SOURCE
+cap = _open_camera()
+if not cap.isOpened():
+    if CAMERA_MOTION_WAKE:
+        _camera_sleeping = True
+        logging.info('Wireless camera sleeping; waiting for motion or live request.')
+        last_sleep_heartbeat = 0.0
+        while not cap.isOpened():
+            now = time.time()
+            if now - last_sleep_heartbeat >= HEARTBEAT_SECONDS:
+                _publish_waiting_for_motion()
+                last_sleep_heartbeat = now
+            cap.release()
+            time.sleep(2)
+            cap = _open_camera()
+        _camera_sleeping = False
+        logging.info('Wireless camera woke; beginning local detection.')
+    else:
+        error_message = f'Cannot open {CAMERA_SOURCE_KIND} camera source'
+        logging.error(error_message)
+        try:
+            (supabase_client.table('camera_status').upsert({
+                'household_id': HOUSEHOLD_ID,
+                'camera_id': CAMERA_ID,
+                'display_name': CAMERA_NAME,
+                'source_kind': CAMERA_SOURCE_KIND,
+                'detector_version': DETECTOR_VERSION,
+                'state': 'error',
+                'process_started_epoch': PROCESS_STARTED_EPOCH,
+                'heartbeat_epoch': int(time.time()),
+                'local_ai_ready': False,
+                'live_ready': False,
+                'audio_available': False,
+                'error_message': error_message,
+                'metrics': {'source_kind': CAMERA_SOURCE_KIND},
+                'updated_at': datetime.now(timezone('UTC')).isoformat(),
+            }, on_conflict='household_id,camera_id').execute())
+        except Exception as exc:
+            logging.warning('Could not publish camera startup error: %s', exc)
+        cap.release()
+        raise SystemExit(1)
 
 def get_notification_settings():
     now = time.time()
@@ -250,9 +531,14 @@ def get_notification_settings():
         rows = resp.data or []
         if rows:
             row = rows[0]
-            email_recipients = row.get('email_recipients') or []
-            phone_recipients = row.get('phone_recipients') or []
-            bother_email = (row.get('bother_email') or '').strip()
+            # A column that is missing entirely (older schema) still falls back to
+            # the env list; a column that is present and empty means "nobody".
+            email_recipients = (row['email_recipients'] or []
+                                if 'email_recipients' in row else ENV_EMAIL_RECIPIENTS)
+            phone_recipients = (row['phone_recipients'] or []
+                                if 'phone_recipients' in row else ENV_PHONE_RECIPIENTS)
+            bother_email = ((row['bother_email'] or '').strip()
+                            if 'bother_email' in row else ENV_BOTHER_EMAIL)
             cooldown = row.get('cooldown_seconds')
             try:
                 cooldown = int(cooldown) if cooldown is not None else COOLDOWN_DURATION
@@ -261,15 +547,13 @@ def get_notification_settings():
             # Clamp to a sane range so a bad dashboard value can't break things.
             cooldown = max(10, min(cooldown, 3600))
             _settings_cache['value'] = {
-                'email_enabled': bool(row.get('email_enabled', True)),
-                'pushover_enabled': bool(row.get('pushover_enabled', True)),
-                # Fall back to env recipients if the table column is empty so the
-                # detector keeps working before the dashboard is populated.
-                'email_recipients': email_recipients if email_recipients else ENV_EMAIL_RECIPIENTS,
-                'phone_recipients': phone_recipients if phone_recipients else ENV_PHONE_RECIPIENTS,
-                'bother_email': bother_email if bother_email else ENV_BOTHER_EMAIL,
+                'email_enabled': bool(row.get('email_enabled', False)),
+                'pushover_enabled': bool(row.get('pushover_enabled', False)),
+                'email_recipients': email_recipients,
+                'phone_recipients': phone_recipients,
+                'bother_email': bother_email,
                 'cooldown_seconds': cooldown,
-                'alert_mode': row.get('alert_mode') or 'every_detection',
+                'alert_mode': row.get('alert_mode') or 'first_of_visit',
                 'notification_title_style': row.get('notification_title_style') or 'smart',
                 'notification_include_photo': bool(row.get('notification_include_photo', True)),
                 'notification_include_activity': bool(row.get('notification_include_activity', True)),
@@ -516,6 +800,8 @@ def send_push_notification(message, title="Detection Alert", image_path=None, pr
             "title": title,
             "body": message,
             "priority": priority,
+            "household_id": HOUSEHOLD_ID,
+            "camera_id": CAMERA_ID,
         }
         if image_path:
             payload["image_path"] = image_path
@@ -561,6 +847,7 @@ def load_florence_blocking(retry_seconds=30):
         try:
             from transformers import AutoProcessor, AutoModelForCausalLM
             import torch
+            torch.set_num_threads(LOCAL_AI_THREADS)
             proc = AutoProcessor.from_pretrained(
                 FLORENCE_MODEL_ID, trust_remote_code=True
             )
@@ -669,8 +956,16 @@ class _CaptionThread(threading.Thread):
         self.finished_at = None
 
     def run(self):
-        self.description = get_florence_description(
-            self.image, self.detected_classes)
+        with inference_slot(
+                f"{CAMERA_ID}:caption",
+                timeout_seconds=AI_CAPTION_QUEUE_SECONDS) as acquired:
+            if acquired:
+                self.description = get_florence_description(
+                    self.image, self.detected_classes)
+            else:
+                logging.warning(
+                    "Caption skipped for %s so a busy camera cannot stall capture.",
+                    CAMERA_ID)
         self.finished_at = time.time()
         elapsed = self.finished_at - self.started_at
         if self.description:
@@ -721,8 +1016,8 @@ def upload_detection_to_supabase(
         return None
     try:
         name = f"{timestamp}.jpg"
-        image_path = f"detections/{HOUSEHOLD_ID}/{name}"
-        thumb_path = f"detections/{HOUSEHOLD_ID}/thumb/{name}"
+        image_path = f"detections/{HOUSEHOLD_ID}/{CAMERA_ID}/{name}"
+        thumb_path = f"detections/{HOUSEHOLD_ID}/{CAMERA_ID}/thumb/{name}"
 
         with open(main_image_path, 'rb') as f:
             raw = f.read()
@@ -763,6 +1058,7 @@ def upload_detection_to_supabase(
         }
         rich_data = {
             **legacy_data,
+            'camera_id': CAMERA_ID,
             'captured_epoch': int(captured_epoch or processed_epoch),
             'processed_epoch': processed_epoch,
             'identity_label': identity_label,
@@ -789,10 +1085,18 @@ def upload_detection_to_supabase(
         detection_id = inserted_row.get('id')
         if detection_id:
             try:
-                visit_resp = supabase_client.rpc(
-                    'attach_detection_to_visit',
-                    {'p_detection_id': detection_id},
-                ).execute()
+                try:
+                    visit_resp = supabase_client.rpc(
+                        'attach_detection_to_camera_visit',
+                        {'p_detection_id': detection_id},
+                    ).execute()
+                except Exception:
+                    # Rolling deployment: the new detector can run briefly
+                    # before the multi-camera migration reaches the box.
+                    visit_resp = supabase_client.rpc(
+                        'attach_detection_to_visit',
+                        {'p_detection_id': detection_id},
+                    ).execute()
                 visit_data = getattr(visit_resp, 'data', None) or {}
             except Exception as exc:
                 logging.warning("Visit attachment unavailable: %s", exc)
@@ -845,15 +1149,20 @@ def update_detection_details(detection_id, description, temp, weather, icon,
             logging.error("Could not update slow detection details: %s", exc)
 
 
-def should_alert_for_visit(settings, storage):
-    """Apply the optional visit notification mode.
-
-    `every_detection` is the default and exactly preserves the current cadence.
-    The visit-aware alternative exists but is inert until explicitly selected.
-    """
-    if settings.get('alert_mode', 'every_detection') != 'first_of_visit':
-        return True
-    return not storage or bool(storage.get('is_new_visit', True))
+def should_alert_for_visit(settings, storage, now, next_alert_epoch):
+    """Decide alerting separately from the already-saved observation."""
+    result = should_alert(settings, storage, now, next_alert_epoch)
+    mode = settings.get('alert_mode')
+    if mode in ('first_of_visit', 'visit_then_repeat') and not result:
+        if storage and storage.get('is_new_visit') is False:
+            logging.info(
+                "Observation saved to the active visit; %s.",
+                "waiting for the repeat cadence"
+                if mode == 'visit_then_repeat' else "repeat alert suppressed")
+        else:
+            logging.warning(
+                "Visit state unavailable; suppressing alert to avoid repeat spam.")
+    return result
 
 def detect_objects_yolo11(frame):
     """Detect objects using YOLOv11."""
@@ -917,25 +1226,9 @@ def detect_objects_yolov3(frame):
         logging.error(f"YOLOv3 detection error: {e}")
         return []
 
-# Initialize camera
-cap = cv2.VideoCapture("/dev/video0")
-if not cap.isOpened():
-    logging.error("Cannot open camera")
-    exit()
-
-logging.info("Camera initialized.")
-
-# On-demand live view. /dev/video0 only allows one reader and this process owns
-# it, so the stream re-serves the frames already being decoded for YOLO rather
-# than opening the camera a second time. Import and start are both guarded:
-# a live view problem must never stop detection.
-try:
-    import live_stream
-    live_stream.start(port=int(os.getenv('STREAM_PORT', '8088')),
-                      token=os.getenv('STREAM_TOKEN', ''))
-except Exception as _exc:
-    live_stream = None
-    logging.error("Live view unavailable: %s", _exc)
+logging.info("Camera initialized (%s source, id=%s).",
+             CAMERA_SOURCE_KIND, CAMERA_ID)
+publish_stream_config()
 
 # Block until Florence-2 is loaded — the detector should never alert without
 # the local VLM ready, per explicit configuration.
@@ -949,13 +1242,15 @@ def send_camera_heartbeat(state=None, error_message=None):
     local_ready = bool(ENABLE_FLORENCE and _FLORENCE_MODEL is not None)
     live_ready = bool(live_stream is not None and live_stream.ready())
     frame_fresh = bool(_last_frame_epoch and now - _last_frame_epoch <= 15)
-    resolved_state = state or (
+    resolved_state = state or ('sleeping' if _camera_sleeping else (
         'ready' if local_ready and live_ready and frame_fresh else 'degraded')
+    )
     resolved_error = error_message or _heartbeat_error
     payload = {
         'household_id': HOUSEHOLD_ID,
         'camera_id': CAMERA_ID,
         'display_name': CAMERA_NAME,
+        'source_kind': CAMERA_SOURCE_KIND,
         'detector_version': DETECTOR_VERSION,
         'state': resolved_state,
         'process_started_epoch': PROCESS_STARTED_EPOCH,
@@ -970,6 +1265,10 @@ def send_camera_heartbeat(state=None, error_message=None):
         'metrics': {
             'viewers': live_stream.viewers() if live_stream is not None else 0,
             'model': FLORENCE_MODEL_ID if local_ready else None,
+            # Never publish CAMERA_SOURCE: a wireless URL can contain a local
+            # address, username, and password. Only the harmless kind belongs
+            # in household-visible health metadata.
+            'source_kind': CAMERA_SOURCE_KIND,
         },
         'updated_at': datetime.now(timezone('UTC')).isoformat(),
     }
@@ -1259,6 +1558,56 @@ def get_learned_profiles(force=False):
         return _learned_profile_cache['profiles']
 
 
+def identify_known_visitor(image_path, animal_bbox):
+    """Recognize a reviewed visitor within the shared Pi AI budget.
+
+    Identity is intentionally allowed only a short wait. If another camera is
+    already captioning, this observation remains useful and reviewable instead
+    of freezing its capture/live loop for half a minute.
+    """
+    cheeto_verdict, cheeto_score = 'unknown', 0.0
+    learned_profile = None
+    learned_score = learned_margin = 0.0
+    with inference_slot(
+            f"{CAMERA_ID}:identity",
+            timeout_seconds=AI_IDENTITY_WAIT_SECONDS) as acquired:
+        if not acquired:
+            return (
+                cheeto_verdict, cheeto_score, learned_profile,
+                learned_score, learned_margin,
+            )
+        reviewed_profiles = get_learned_profiles()
+        if reviewed_profiles and 'match_learned_profiles' in globals():
+            learned_profile, learned_score, learned_margin = match_learned_profiles(
+                image_path,
+                animal_bbox,
+                reviewed_profiles,
+                threshold=LEARNED_PROFILE_THRESHOLD,
+                min_margin=LEARNED_PROFILE_MIN_MARGIN,
+                num_threads=CHEETO_ID_THREADS,
+            )
+            if learned_profile:
+                logging.info(
+                    "Reviewed visitor ID: %s (similarity %.3f, margin %.3f).",
+                    learned_profile['name'], learned_score, learned_margin)
+                cheeto_verdict = ('cheeto'
+                                  if learned_profile['slug'] == 'cheeto'
+                                  else 'not_cheeto')
+                cheeto_score = learned_score
+        elif _CHEETO_PROTOTYPE and identify_cheeto:
+            cheeto_verdict, cheeto_score = identify_cheeto(
+                image_path, animal_bbox, _CHEETO_PROTOTYPE,
+                num_threads=CHEETO_ID_THREADS,
+            )
+            logging.info(
+                "Cheeto ID: %s (similarity %.3f vs threshold %.3f)",
+                cheeto_verdict, cheeto_score, _CHEETO_PROTOTYPE['threshold'])
+    return (
+        cheeto_verdict, cheeto_score, learned_profile,
+        learned_score, learned_margin,
+    )
+
+
 def best_animal_bbox(frame):
     """Highest-confidence animal box in a frame, or None. Re-runs YOLO rather
     than reusing the trigger frame's box: the saved frame is captured
@@ -1346,17 +1695,57 @@ get_learned_profiles(force=True)
 
 logging.info("Beginning main loop...")
 
-cooldown_end_time = 0.0
+next_observation_time = 0.0
+next_alert_time = 0.0
 detection_streak = 0  # consecutive frames with a target class in view
+_capture_idle = False  # true while capture is paused waiting for the sensor
 
 try:
     while True:
         start_loop = time.time()
+
+        # Nothing moving and nobody watching: do not touch the camera at all.
+        # Heartbeats run on their own thread, so the household still sees this
+        # camera as online while it waits.
+        if not _capture_allowed():
+            if not _capture_idle:
+                _capture_idle = True
+                logging.info(
+                    'No motion and no live viewer; pausing frame capture until '
+                    'the sensor fires.')
+                if live_stream is not None:
+                    live_stream.clear()
+            time.sleep(CAPTURE_IDLE_POLL_SECONDS)
+            continue
+        if _capture_idle:
+            _capture_idle = False
+            logging.info('Motion or a live viewer; resuming frame capture.')
+
         ret, frame = cap.read()
         if not ret:
-            logging.error("Frame grab failed.")
-            _heartbeat_error = 'Camera frame grab failed'
-            break
+            if not CAMERA_MOTION_WAKE:
+                logging.error("Frame grab failed.")
+                _heartbeat_error = 'Camera frame grab failed'
+                break
+            logging.info('Wireless camera returned to sleep.')
+            _camera_sleeping = True
+            _heartbeat_error = None
+            cap.release()
+            if live_stream is not None:
+                live_stream.clear()
+            send_camera_heartbeat(state='sleeping')
+            while True:
+                time.sleep(2)
+                cap = _open_camera()
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret:
+                        _camera_sleeping = False
+                        logging.info('Wireless camera woke again.')
+                        break
+                cap.release()
+            if not ret:
+                continue
 
         _last_frame_epoch = int(time.time())
 
@@ -1368,7 +1757,8 @@ try:
 
         current_time = time.time()
 
-        if ENABLE_CAT_DETECTION and current_time >= cooldown_end_time:
+        if (ENABLE_CAT_DETECTION and current_time >= next_observation_time and
+                _motion_detection_allowed()):
             # Choose detection method based on available model
             if model is not None:
                 detections = detect_objects_yolo11(frame)
@@ -1403,7 +1793,10 @@ try:
                 frame = settled_frame
 
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                full_image_path = f'detection_{timestamp}.jpg'
+                # Detector instances share one working directory. Include the
+                # stable camera id so simultaneous cameras can never overwrite
+                # each other's temporary frame before upload.
+                full_image_path = f'detection_{CAMERA_ID}_{timestamp}.jpg'
                 cv2.imwrite(full_image_path, frame)
 
                 # Kick off local caption generation in parallel with the GIF
@@ -1421,37 +1814,9 @@ try:
                 # prototype is only a fallback for households with no reviewed
                 # library; letting it decide first is what caused Rocky to be
                 # swallowed by a broad "orange cat" average.
-                cheeto_verdict, cheeto_score = 'unknown', 0.0
-                learned_profile = None
-                learned_score = learned_margin = 0.0
-                reviewed_profiles = get_learned_profiles()
-                if reviewed_profiles and 'match_learned_profiles' in globals():
-                    learned_profile, learned_score, learned_margin = match_learned_profiles(
-                        full_image_path,
-                        animal_bbox,
-                        reviewed_profiles,
-                        threshold=LEARNED_PROFILE_THRESHOLD,
-                        min_margin=LEARNED_PROFILE_MIN_MARGIN,
-                        num_threads=CHEETO_ID_THREADS,
-                    )
-                    if learned_profile:
-                        logging.info(
-                            "Reviewed visitor ID: %s (similarity %.3f, margin %.3f).",
-                            learned_profile['name'], learned_score, learned_margin)
-                        cheeto_verdict = ('cheeto'
-                                          if learned_profile['slug'] == 'cheeto'
-                                          else 'not_cheeto')
-                        cheeto_score = learned_score
-                elif _CHEETO_PROTOTYPE and identify_cheeto:
-                    cheeto_verdict, cheeto_score = identify_cheeto(
-                        full_image_path, animal_bbox, _CHEETO_PROTOTYPE,
-                        num_threads=CHEETO_ID_THREADS,
-                    )
-                    logging.info(
-                        f"Cheeto ID: {cheeto_verdict} (similarity "
-                        f"{cheeto_score:.3f} vs threshold "
-                        f"{_CHEETO_PROTOTYPE['threshold']:.3f})"
-                    )
+                (cheeto_verdict, cheeto_score, learned_profile,
+                 learned_score, learned_margin) = identify_known_visitor(
+                    full_image_path, animal_bbox)
 
                 known_name = (learned_profile['name'] if learned_profile else
                               ('Cheeto' if cheeto_verdict == 'cheeto' else None))
@@ -1468,6 +1833,7 @@ try:
                 temp = weather = icon = None
                 storage = None
                 pushed = False
+                alert_this_detection = False
 
                 if known_name:
                     temp, weather, icon = fetch_weather_data()
@@ -1490,7 +1856,9 @@ try:
                         False, None, fast_description,
                         temp, weather, captured_epoch, known_name=known_name,
                         settings=early_settings)
-                    if should_alert_for_visit(early_settings, storage):
+                    alert_this_detection = should_alert_for_visit(
+                        early_settings, storage, current_time, next_alert_time)
+                    if alert_this_detection:
                         include_photo = early_settings.get(
                             'notification_include_photo', True)
                         send_pushover_notification(
@@ -1503,7 +1871,10 @@ try:
                                         if include_photo else None),
                             priority=0)
                         pushed = True
-                    logging.info("Fast-path known-visitor alert completed before captioning.")
+                        next_alert_time = (
+                            current_time + early_settings['cooldown_seconds'])
+                        logging.info(
+                            "Fast-path known-visitor alert completed before captioning.")
 
                 if ENABLE_FLORENCE:
                     caption_image = crop_for_caption(
@@ -1522,8 +1893,9 @@ try:
                 # unsent, starving Florence of cores on a 4-core Pi.
                 gif_path = None
                 if (early_settings['email_enabled'] and
-                        early_settings.get('notification_include_photo', True)):
-                    gif_path = f'detection_{timestamp}.gif'
+                        early_settings.get('notification_include_photo', True) and
+                        (storage is None or alert_this_detection)):
+                    gif_path = f'detection_{CAMERA_ID}_{timestamp}.gif'
                     try:
                         capture_burst_gif(cap, frame, gif_path)
                     except Exception as e:
@@ -1570,7 +1942,7 @@ try:
                     # Short cooldown so a flickering YOLO false-positive doesn't
                     # spam Florence on every frame, but not the full cooldown
                     # since this wasn't a real detection.
-                    cooldown_end_time = current_time + 30
+                    next_observation_time = current_time + 30
                     continue
 
                 # Fetch weather data
@@ -1606,25 +1978,7 @@ try:
                     attachments.append(gif_path)
 
                 settings = get_notification_settings()
-                if 'cat' in reported_classes:
-                    send_email_with_attachments(
-                        image_paths=attachments,
-                        subject=subject,
-                        message=message,
-                        phone_recipients=settings['phone_recipients'],
-                        email_recipients=settings['email_recipients'],
-                    )
-                    push_priority = 0
-                else:
-                    if settings['bother_email']:
-                        send_email_with_attachments(
-                            image_paths=attachments,
-                            subject=subject,
-                            message=message,
-                            phone_recipients=[],
-                            email_recipients=[settings['bother_email']],
-                        )
-                    push_priority = 1
+                push_priority = 0 if 'cat' in reported_classes else 1
 
                 identity_label = (known_slug if known_slug
                                   else (reported_classes[0]
@@ -1657,11 +2011,37 @@ try:
                         frame_quality=frame_quality,
                     )
 
+                # A detection is always attached to a visit and saved before
+                # this decision.  In once-per-visit mode only the first saved
+                # observation fans out; later observations remain available in
+                # the visit gallery and can improve its best frame.
+                if not pushed:
+                    alert_this_detection = should_alert_for_visit(
+                        settings, storage, current_time, next_alert_time)
+
+                if alert_this_detection:
+                    if 'cat' in reported_classes:
+                        send_email_with_attachments(
+                            image_paths=attachments,
+                            subject=subject,
+                            message=message,
+                            phone_recipients=settings['phone_recipients'],
+                            email_recipients=settings['email_recipients'],
+                        )
+                    elif settings['bother_email']:
+                        send_email_with_attachments(
+                            image_paths=attachments,
+                            subject=subject,
+                            message=message,
+                            phone_recipients=[],
+                            email_recipients=[settings['bother_email']],
+                        )
+
                 # Both notifiers fire while the self-hosted path is on trial, so
                 # expect two alerts per detection until ENABLE_PUSHOVER is set
                 # to 0. Pushover attaches the LOCAL jpeg; the dispatcher refers
                 # to the thumbnail already in Storage.
-                if not pushed and should_alert_for_visit(settings, storage):
+                if alert_this_detection and not pushed:
                     include_photo = settings.get('notification_include_photo', True)
                     send_pushover_notification(
                         message=message,
@@ -1669,7 +2049,6 @@ try:
                         image_path=(full_image_path if include_photo else None),
                         priority=push_priority,
                     )
-
                     send_push_notification(
                         message=message,
                         title=subject,
@@ -1677,6 +2056,9 @@ try:
                                     if include_photo else None),
                         priority=push_priority,
                     )
+
+                if alert_this_detection:
+                    next_alert_time = current_time + settings['cooldown_seconds']
 
                 # Clean up local files so the Pi disk doesn't fill up.
                 for p in (full_image_path, gif_path):
@@ -1686,7 +2068,8 @@ try:
                         except OSError as e:
                             logging.warning(f"Could not remove {p}: {e}")
 
-                cooldown_end_time = current_time + settings['cooldown_seconds']
+                next_observation_time = (
+                    current_time + OBSERVATION_INTERVAL_SECONDS)
 
         elapsed_time = time.time() - start_loop
         if elapsed_time < FRAME_DELAY:
