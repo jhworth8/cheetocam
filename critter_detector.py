@@ -179,6 +179,13 @@ ENABLE_MULTI_CLASS_DETECTION = 1
 # latency and kills single-frame YOLO flickers — the main false-positive
 # source (shadows, the doormat pattern, headlights).
 CONFIRM_FRAMES = int(os.getenv('CONFIRM_FRAMES', '2'))
+# Shortest gap between YOLO runs. Without this the loop inferences on every
+# captured frame forever, which pins the front-door unit at its 150% quota and
+# holds live view down to the detection rate — measured at 2fps on a camera
+# perfectly capable of far more. Capture and publish now run free; detection
+# samples. At 0.3s a two-frame confirmation still takes under a second.
+DETECT_MIN_INTERVAL = max(
+    0.0, float(os.getenv('DETECT_MIN_INTERVAL_SECONDS', '0.3')))
 
 COOLDOWN_DURATION = int(os.getenv('COOLDOWN_DURATION', '180'))
 # Saving another useful view of a visitor is not the same thing as alerting the
@@ -1790,6 +1797,7 @@ _capture_idle = False  # true while capture is paused waiting for the sensor
 # Any sighting at all, confirmed or not. Battery saver reads this to decide
 # that now is not the moment to be economical about frames.
 _last_activity_epoch = 0.0
+next_detect_time = 0.0
 
 try:
     while True:
@@ -1852,7 +1860,9 @@ try:
         current_time = time.time()
 
         if (ENABLE_CAT_DETECTION and current_time >= next_observation_time and
+                current_time >= next_detect_time and
                 _motion_detection_allowed()):
+            next_detect_time = current_time + DETECT_MIN_INTERVAL
             # Choose detection method based on available model
             if model is not None:
                 detections = detect_objects_yolo11(frame)
@@ -1938,7 +1948,7 @@ try:
                         detected_classes, detectionTemp=temp,
                         detectionWeather=weather, detectionIcon=icon,
                         captured_epoch=captured_epoch,
-                        identity_label=known_slug,
+                        identity_label=known_name,
                         identity_confidence=known_score,
                         identity_source=known_source,
                         animal_id=known_animal_id, bbox=animal_bbox,
@@ -2075,7 +2085,10 @@ try:
                 settings = get_notification_settings()
                 push_priority = 0 if 'cat' in reported_classes else 1
 
-                identity_label = (known_slug if known_slug
+                # known_name, not known_slug: the user and owner-history
+                # paths both store the display name, and writing "cheeto"
+                # here split one cat into two visitors everywhere downstream.
+                identity_label = (known_name if known_name
                                   else (reported_classes[0]
                                         if len(reported_classes) == 1
                                         else 'unknown'))
