@@ -1703,6 +1703,40 @@ def identify_known_visitor(image_path, animal_bbox):
     )
 
 
+def auto_confirm_sample(detection_id, learned_profile, score, margin,
+                        profile_count):
+    """Let a confident match become training data without being asked about.
+
+    A profile only grew when somebody tapped "yes, that's him", which is why
+    Rocky sat on ten samples against Cheeto's hundred and twenty-five.
+
+    Guarded hard, because feeding a model its own output is how it drifts. The
+    server enforces the score and margin bar and the per-profile quota; this
+    side adds the one check the server cannot make — that the margin means
+    anything at all. With a single profile there is no runner-up, so
+    match_learned_profiles reports the raw score as the margin, and a lone
+    profile would auto-confirm everything it ever saw.
+    """
+    if not (detection_id and learned_profile and profile_count > 1):
+        return
+    try:
+        response = supabase_client.rpc('household_auto_confirm_sample', {
+            'p_household_id': HOUSEHOLD_ID,
+            'p_detection_id': detection_id,
+            'p_animal_id': learned_profile['animal_id'],
+            'p_score': float(score),
+            'p_margin': float(margin),
+        }).execute()
+        result = getattr(response, 'data', None) or {}
+        if result.get('accepted'):
+            logging.info(
+                'Auto-confirmed a %s sample (score %.3f, margin %.3f; '
+                '%s owner + %s auto).', learned_profile['name'], score, margin,
+                result.get('owner'), result.get('auto'))
+    except Exception as exc:
+        logging.debug('Auto-confirm skipped: %s', exc)
+
+
 def best_animal_bbox(frame):
     """Highest-confidence animal box in a frame, or None. Re-runs YOLO rather
     than reusing the trigger frame's box: the saved frame is captured
@@ -1955,6 +1989,10 @@ try:
                         needs_review=False,
                         frame_quality=frame_quality,
                     )
+                    auto_confirm_sample(
+                        (storage or {}).get('detection_id'), learned_profile,
+                        learned_score, learned_margin,
+                        len(get_learned_profiles()))
                     subject, fast_message = build_notification(
                         [('cat' if cheeto_verdict == 'cheeto' else
                           learned_profile.get('species', 'animal'))],
