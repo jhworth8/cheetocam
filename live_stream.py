@@ -48,7 +48,14 @@ _last_viewer_request = 0.0  # polling Flutter client's most recent request
 _token = ''
 _started = False
 
-JPEG_QUALITY = 70
+# Bytes per frame are the whole cost of live view once a stream leaves the LAN.
+# On the Pi these defaults are free; through the tunnel they are the bottleneck,
+# so a camera reached from outside can trade sharpness for frames without
+# touching the one at the front door. The defaults are the values that were
+# hardcoded here, so an .env setting neither behaves exactly as before.
+JPEG_QUALITY = max(20, min(95, int(os.getenv('STREAM_JPEG_QUALITY', '70'))))
+# 0 means "no cap" — send the frame at its native width.
+STREAM_MAX_WIDTH = max(0, int(os.getenv('STREAM_MAX_WIDTH', '0')))
 IDLE_SLEEP = 0.04
 # A viewer that stalls should not hold a thread forever.
 MAX_STREAM_SECONDS = 60 * 30
@@ -136,12 +143,16 @@ def audio_available():
     disappearing without affecting video or detection.
     """
     enabled = os.getenv('STREAM_AUDIO_ENABLED', '1').strip().lower()
-    return bool(
-        enabled not in ('0', 'false', 'no', 'off')
-        and _started
-        and shutil.which('ffmpeg')
-        and os.path.isdir('/dev/snd')
-    )
+    if enabled in ('0', 'false', 'no', 'off') or not _started:
+        return False
+    if not shutil.which('ffmpeg'):
+        return False
+    # A network camera carries its audio inside its own stream, so there is no
+    # local sound card to look for and /dev/snd says nothing about whether
+    # listening will work.
+    if os.getenv('STREAM_AUDIO_SOURCE', '').strip():
+        return True
+    return os.path.isdir('/dev/snd')
 
 
 class _AudioSource:
@@ -177,13 +188,25 @@ class _AudioSource:
                 self._stop_locked()
 
     def _start_locked(self):
-        device = os.getenv('STREAM_AUDIO_DEVICE', 'plughw:CARD=B100,DEV=0')
+        # Two shapes of microphone. A USB mic on the Pi is an ALSA device and
+        # belongs to the camera it sits next to. A network camera carries its
+        # own audio inside its stream, and STREAM_AUDIO_SOURCE names that
+        # stream. Everything downstream is identical: one mono 16-bit PCM
+        # pipe, fanned out to live listeners and the rewind ring.
+        source = os.getenv('STREAM_AUDIO_SOURCE', '').strip()
+        if source:
+            # TCP for the same reason the detector reads RTSP over TCP: UDP
+            # loss on this stream arrives as audible dropouts.
+            input_args = ['-rtsp_transport', 'tcp', '-i', source]
+        else:
+            device = os.getenv('STREAM_AUDIO_DEVICE', 'plughw:CARD=B100,DEV=0')
+            input_args = ['-f', 'alsa', '-i', device]
         try:
             self._process = subprocess.Popen(
-                ['ffmpeg', '-hide_banner', '-loglevel', 'error',
-                 '-f', 'alsa', '-i', device,
-                 '-ac', '1', '-ar', str(AUDIO_RATE),
-                 '-f', 's16le', 'pipe:1'],
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error']
+                + input_args
+                + ['-vn', '-ac', '1', '-ar', str(AUDIO_RATE),
+                   '-f', 's16le', 'pipe:1'],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
         except Exception as exc:
             logging.warning('Microphone unavailable: %s', exc)
@@ -477,7 +500,8 @@ class _Handler(BaseHTTPRequestHandler):
                     if seq == last_seq:
                         time.sleep(IDLE_SLEEP)
                         continue
-                    data, seq = _encode_latest()
+                    data, seq = _encode_latest(
+                        max_width=STREAM_MAX_WIDTH or None)
                     if data is None:
                         time.sleep(IDLE_SLEEP)
                         continue

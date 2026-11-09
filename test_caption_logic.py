@@ -5,6 +5,8 @@ Run directly (no pytest needed):  python3 test_caption_logic.py
 """
 
 from caption_logic import (
+    ANIMAL_CLASSES,
+    IGNORED_ANIMALS,
     animals_in_caption,
     looks_like_false_positive,
     should_suppress,
@@ -167,6 +169,53 @@ def test_caption_names_animal_yolo_has_no_class_for():
     assert reported == ['raccoon']
     # A raccoon caption is an animal — must NOT be suppressed.
     assert not should_suppress(['dog'], caption)
+
+
+def test_ignored_species_is_not_a_yolo_class():
+    # The cheapest half of the rule: YOLO is never asked about a bird, so a
+    # feeder costs no capture, no caption and no CPU.
+    assert 'bird' in IGNORED_ANIMALS, "default config should ignore birds"
+    for ignored in IGNORED_ANIMALS:
+        assert ignored not in ANIMAL_CLASSES
+    # Everything else the detector cares about survives the subtraction.
+    assert 'cat' in ANIMAL_CLASSES and 'dog' in ANIMAL_CLASSES
+    assert 'giraffe' in ANIMAL_CLASSES
+
+
+def test_bird_caption_suppresses_the_detection():
+    # The path that still reaches stage four: the nano model calls a crow a
+    # cat, Florence reads it correctly.
+    caption = "A black bird is standing on the porch railing near the door."
+    assert should_suppress(['cat'], caption)
+    assert should_suppress(['bear'], "A small sparrow is perched on the mat.")
+
+
+def test_bird_alongside_a_real_animal_still_alerts():
+    # Only-ignored means only. A cat in the frame is still news, and the bird
+    # never makes it into what we report.
+    caption = "An orange cat is watching a bird from the doormat."
+    assert not should_suppress(['cat'], caption)
+    reported, _, hedged = resolve_reported_classes(['cat'], caption)
+    assert reported == ['cat'], reported
+    assert not hedged
+
+
+def test_confirmed_cheeto_is_never_dropped_by_a_bird_caption():
+    # The identity model is the only veto: one bad caption must not throw away
+    # a confirmed match.
+    caption = "A bird is sitting on the steps outside the front door."
+    assert not should_suppress(['cat'], caption, cheeto_verdict='cheeto')
+    reported, _, _ = resolve_reported_classes(
+        ['cat'], caption, 'florence', 'cheeto')
+    assert reported == ['cat']
+
+
+def test_bird_is_never_reported_even_when_the_visit_survives():
+    # A recognised visitor skips suppression upstream, so resolve still has to
+    # refuse to call the visit a bird.
+    reported, note, hedged = resolve_reported_classes(
+        ['cat'], "A bird near the door.", 'florence', 'unknown')
+    assert 'bird' not in reported, reported
 
 
 def test_animals_in_caption_priority_and_wordboundaries():

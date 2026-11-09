@@ -3,6 +3,7 @@
 detector actually reports. No camera/model/network dependencies, so it can be
 unit tested off the Pi — see test_caption_logic.py."""
 
+import os
 import re
 
 # Animals that can actually show up at the door — reported as-is when the
@@ -15,7 +16,27 @@ PLAUSIBLE_ANIMAL_CLASSES = ['cat', 'dog', 'bird']
 # what to call it, and with no caption we hedge to 'cat'.
 LOOKALIKE_ANIMAL_CLASSES = ['horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe']
 
-ANIMAL_CLASSES = PLAUSIBLE_ANIMAL_CLASSES + LOOKALIKE_ANIMAL_CLASSES
+# Species the household does not want to hear about at all. A porch feeder or
+# a hedge full of sparrows fires the detector all day, and every one of those
+# firings costs a capture, a GIF burst, ~30s of Florence and a CLIP pass on a
+# Pi that is already CPU-bound — so an ignored species is dropped in two
+# places, as early as each one can act:
+#   1. It is removed from ANIMAL_CLASSES below, so YOLO never fires on it and
+#      nothing downstream runs at all. This is where the CPU is saved.
+#   2. A caption naming ONLY ignored species suppresses the detection, which
+#      catches the real remaining path: the nano model calling a crow a "cat"
+#      at porch distance, with Florence then correctly reading it as a bird.
+# Comma-separated names, matching the canonical names in _CAPTION_ANIMAL_MAP.
+# Set IGNORE_ANIMALS= (empty) to alert on everything again.
+IGNORED_ANIMALS = [
+    a.strip().lower()
+    for a in os.getenv('IGNORE_ANIMALS', 'bird').split(',')
+    if a.strip()
+]
+
+# What YOLO is actually told to watch for. Ignored species are not in it.
+ANIMAL_CLASSES = [c for c in PLAUSIBLE_ANIMAL_CLASSES + LOOKALIKE_ANIMAL_CLASSES
+                  if c not in IGNORED_ANIMALS]
 
 # Fine-grained wild species. Florence-2-base (230M) reliably tells cat from
 # dog from bird, but on anything beyond that its species name is a guess, and
@@ -118,20 +139,44 @@ def looks_like_false_positive(description):
     return False
 
 
-def should_suppress(detected_classes, description):
-    """Decide whether to drop the detection as a false positive, based on the
-    VLM caption. True = suppress the whole alert.
+def only_ignored_species(names):
+    """True when every animal named is one the household ignores, and there is
+    at least one. Empty in, False out: "nothing named" is not "only birds"."""
+    return bool(names) and all(n in IGNORED_ANIMALS for n in names)
+
+
+def should_suppress(detected_classes, description, cheeto_verdict=None):
+    """Decide whether to drop the detection, based on the VLM caption.
+    True = suppress the whole alert.
 
     Beyond looks_like_false_positive: a non-trivial caption that names no
     animal vocabulary at all means the VLM described the scene and saw no
     critter — YOLO hallucinated one from shadows or the doormat pattern. A
     real animal at the door is the salient subject, so DETAILED_CAPTION
-    reliably mentions it. An empty/failed caption never suppresses."""
+    reliably mentions it. An empty/failed caption never suppresses.
+
+    An ignored species (default: birds) is dropped here too. YOLO no longer
+    watches for those classes at all, so what reaches this point is the nano
+    model mistaking a bird for one of the classes it DOES watch, and the
+    caption is the thing that can tell. That follows this module's standing
+    rule that the caption outranks YOLO's label; the identity model is the
+    only veto, since a confirmed Cheeto must never be thrown away over one
+    bad caption."""
     if looks_like_false_positive(description):
         return True
     if description and len(description) >= 20:
         text = description.lower()
         if not any(re.search(r'\b' + w + r'\b', text) for w in _ANIMAL_VOCAB):
+            return True
+    if cheeto_verdict != 'cheeto':
+        caption_animals = animals_in_caption(description)
+        if only_ignored_species(caption_animals):
+            return True
+        # No usable caption, and YOLO's own labels are all ignored species.
+        # Only reachable if IGNORE_ANIMALS changed under a running detector,
+        # but cheap insurance against alerting on what we were told to ignore.
+        if not caption_animals and only_ignored_species(
+                list(dict.fromkeys(detected_classes))):
             return True
     return False
 
@@ -168,7 +213,8 @@ def resolve_reported_classes(detected_classes, description, caption_source=None,
         # orange cat, almost fox-like") is one animal, not two — the species
         # the model actually knows wins.
         confident = [a for a in caption_animals
-                     if a not in SPECULATIVE_CAPTION_ANIMALS]
+                     if a not in SPECULATIVE_CAPTION_ANIMALS
+                     and a not in IGNORED_ANIMALS]
         if confident:
             return confident, None, False
 
@@ -195,7 +241,8 @@ def resolve_reported_classes(detected_classes, description, caption_source=None,
         # A wild species with independent evidence that it is not Cheeto.
         return caption_animals, None, True
 
-    plausible = [c for c in detected_unique if c in PLAUSIBLE_ANIMAL_CLASSES]
+    plausible = [c for c in detected_unique
+                 if c in PLAUSIBLE_ANIMAL_CLASSES and c not in IGNORED_ANIMALS]
     if plausible:
         return plausible, None, False
 

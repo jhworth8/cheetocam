@@ -75,12 +75,22 @@ look for `cat`; it watches a deliberately widened list from `caption_logic.py`:
 ```python
 PLAUSIBLE_ANIMAL_CLASSES  = ['cat', 'dog', 'bird']
 LOOKALIKE_ANIMAL_CLASSES  = ['horse','sheep','cow','elephant','bear','zebra','giraffe']
+IGNORED_ANIMALS           = ['bird']            # env IGNORE_ANIMALS
+ANIMAL_CLASSES            = (PLAUSIBLE + LOOKALIKE) - IGNORED
 ```
 
 A nano model on a dark Michigan porch will label the cat a "giraffe". Those
 lookalike classes are therefore **detected but never reported verbatim** —
 they exist so a mislabeled cat cannot slip past unalerted. What the animal is
 actually called gets decided later, in stage four.
+
+**Ignored species.** `IGNORE_ANIMALS` (default `bird`) subtracts from that
+list before YOLO ever sees it, which is the only place a species can be
+dropped for free: no box, no confirmation, no capture, no GIF, no ~30s of
+Florence, no CLIP. A feeder or a hedge full of sparrows would otherwise run
+the whole pipeline all day on a Pi that §3 already notes is CPU-bound.
+Blank the variable to alert on everything again. Stage four carries the other
+half of this rule.
 
 **Confirmation.** A single frame with a box is not a detection.
 `CONFIRM_FRAMES` (default 2) consecutive frames must contain a target class
@@ -278,6 +288,15 @@ box is the cat.
 explicit negation ("no animal", "empty doorway"), or a description that talks
 about a person and objects while mentioning *no* animal vocabulary at all. That
 second one catches YOLO hallucinating a cat out of a person's shadow.
+
+**Ignored species, second half.** Stage one removed `bird` from YOLO's class
+list, so the only bird that can still reach here is one YOLO called something
+else — a crow read as a "cat" at porch distance. A caption naming *only*
+ignored species therefore suppresses the detection, on the same standing rule
+that the caption outranks YOLO's label. The identity model is the sole veto:
+a confirmed Cheeto (or any recognised household pet) is never dropped over one
+bad caption, and an ignored species is never *reported* even when something
+else keeps the detection alive.
 
 ---
 

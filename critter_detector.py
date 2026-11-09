@@ -23,6 +23,7 @@ from ultralytics import YOLO
 
 from caption_logic import (
     ANIMAL_CLASSES,
+    IGNORED_ANIMALS,
     should_suppress,
     resolve_reported_classes,
 )
@@ -171,6 +172,9 @@ ALL_YOLO_CLASSES = [
 # model regularly mislabels the cat as one of them, and we don't want a
 # mislabeled cat to slip through), but they're never REPORTED verbatim — the
 # VLM caption decides what to call the animal.
+# Species listed in IGNORE_ANIMALS (birds by default) are already stripped out
+# of ANIMAL_CLASSES, so YOLO is never even asked about them and a feeder full
+# of sparrows costs this Pi nothing.
 DETECTION_CLASSES = ANIMAL_CLASSES
 ENABLE_MULTI_CLASS_DETECTION = 1
 
@@ -2063,15 +2067,18 @@ try:
                 )
 
                 # False-positive filter: skip everything (notification +
-                # upload) only when the local caption describes an
-                # animal-free scene.
+                # upload) when the local caption describes an animal-free
+                # scene, or describes only a species the household ignores
+                # (IGNORE_ANIMALS, birds by default).
                 # Catches YOLO hallucinating a "dog" from shadows or the
-                # doormat pattern.
+                # doormat pattern, and the bird it called a cat.
                 if (not known_name and
                         (vlm_says_absent or
-                         should_suppress(detected_classes, description))):
+                         should_suppress(detected_classes, description,
+                                         cheeto_verdict))):
                     logging.info(
-                        "Suppressing alert: AI says no animal present. "
+                        "Suppressing alert: AI says no animal present, or only "
+                        f"an ignored species ({IGNORED_ANIMALS}). "
                         f"YOLO classes were {detected_classes}, "
                         f"description: {_safe_log_snippet(description)!r}"
                     )
